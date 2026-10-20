@@ -14,8 +14,9 @@
 
 """Harness² Model Context Protocol (MCP) Server.
 
-Exposes Harness² recursive agent harnessing capabilities, demo runner, and domain
-experience library inspection to Claude Code, Codex, OpenCode, and Antigravity (agy).
+Exposes Harness² recursive agent harnessing capabilities, SQLite memory engine,
+controlled worktree lifecycle management, and general task solving to Claude Code,
+Codex, OpenCode, and Antigravity (agy).
 """
 
 from __future__ import annotations
@@ -31,14 +32,17 @@ from typing import Any, Dict, List, Optional
 from mcp.server.mcpserver import MCPServer
 
 from harness2 import config
+from harness2.adapters.general import GeneralTaskAdapter
+from harness2.adapters.worktree import WorktreeManager
+from harness2.core.memory_db import MemoryDB
 
 server = MCPServer(
     name="harness2",
     instructions=(
-        "Harness² MCP Server: Automates recursive agent harnessing (Propose-Probe-Compose) "
-        "and manages persistent domain experience libraries (skills, scripts, guardrails)."
+        "Harness² MCP Server: Automates recursive agent harnessing (Propose-Probe-Compose), "
+        "SQLite-backed persistent session & long-term memory, and isolated worktree execution."
     ),
-    version="0.2.0",
+    version="0.3.0",
 )
 
 
@@ -148,7 +152,7 @@ def _detect_workspace_format(dest: Path) -> str:
         return "codex"
     if (dest / ".claude").is_dir() or (dest / ".claude.json").is_file():
         return "claude"
-    return "opencode"  # default to opencode convention when ambiguous
+    return "opencode"
 
 
 @server.tool()
@@ -166,9 +170,6 @@ def harness2_apply_harness(
     - agy: writes to .gemini/skills/<name>/..., scripts/..., and .gemini/rules/
     - codex: writes to .agents/skills/<name>/..., scripts/..., and AGENTS.md
     - claude: writes to .claude/skills/<name>/..., scripts/..., and CLAUDE.md
-
-    Preserves full subdirectories under skills/ to prevent collisions between different SKILL.md files.
-    Defaults to dry_run=True to allow inspection before writing.
 
     Args:
         harness_path: Absolute or relative path to the harness source directory.
@@ -194,9 +195,7 @@ def harness2_apply_harness(
             rel_path = file_path.relative_to(src)
             parts = rel_path.parts
 
-            # Determine destination path preserving directory structure
             if "skills" in parts:
-                # Find index of 'skills' and preserve all nested subdirectories (e.g. skills/<name>/SKILL.md)
                 skills_idx = parts.index("skills")
                 subpath = Path(*parts[skills_idx + 1 :]) if len(parts) > skills_idx + 1 else Path(file)
                 if chosen_format == "agy":
@@ -205,7 +204,7 @@ def harness2_apply_harness(
                     target_file = dest / ".agents" / "skills" / subpath
                 elif chosen_format == "claude":
                     target_file = dest / ".claude" / "skills" / subpath
-                else:  # opencode
+                else:
                     target_file = dest / ".opencode" / "skills" / subpath
 
             elif "scripts" in parts:
@@ -220,7 +219,7 @@ def harness2_apply_harness(
                     target_file = dest / "AGENTS.md"
                 elif chosen_format == "claude":
                     target_file = dest / "CLAUDE.md"
-                else:  # opencode
+                else:
                     target_file = dest / "AGENTS.md"
             else:
                 target_file = dest / rel_path
@@ -244,7 +243,6 @@ def harness2_apply_harness(
             "operations": planned_operations,
         }
 
-    # Execute file modifications safely
     executed_files: List[str] = []
     backups_created: List[str] = []
 
@@ -266,6 +264,136 @@ def harness2_apply_harness(
         "format": chosen_format,
         "files_written": executed_files,
         "backups_created": backups_created,
+    }
+
+
+@server.tool()
+def harness2_solve(
+    goal: str,
+    workspace: str,
+    verify_cmd: Optional[str] = None,
+    domain: str = "general",
+) -> Dict[str, Any]:
+    """Initiate a general task run inside an isolated git worktree without altering main.
+
+    Creates a session record in SQLite (.harness2/memory.db) and executes candidate rollouts
+    in isolated git worktrees. The worktrees stay intact for inspection until harness2_finish is called.
+
+    Args:
+        goal: The task goal or problem to solve.
+        workspace: Path to the target git repository.
+        verify_cmd: Optional verification command to test changes (e.g. 'pytest', 'npm test').
+        domain: Domain or project category (default: 'general').
+    """
+    ws = Path(workspace).expanduser().resolve()
+    if not (ws / ".git").exists():
+        return {"status": "error", "message": f"{ws} is not a git repository."}
+
+    adapter = GeneralTaskAdapter(repo_root=ws, goal=goal, domain=domain, verify_cmd=verify_cmd)
+    sess_id = adapter.session_id
+
+    # Execute initial rollout in worktree
+    run_dir = adapter.execute(task_id=sess_id, harness_dir=None, run_id="probe_1")
+
+    diff_text = adapter.deliverable_text(run_dir)
+    test_out = (run_dir / "test_output.txt").read_text(encoding="utf-8")
+    wt_path = (run_dir / "worktree_path.txt").read_text(encoding="utf-8")
+
+    return {
+        "status": "ready_for_review",
+        "session_id": sess_id,
+        "worktree_path": wt_path,
+        "git_diff": diff_text,
+        "verification_output": test_out,
+        "instructions": (
+            f"Review changes in worktree '{wt_path}'. "
+            f"When finished, call harness2_finish(session_id='{sess_id}', workspace='{workspace}', action='accept'|'discard') "
+            "to clean up the worktree."
+        ),
+    }
+
+
+@server.tool()
+def harness2_finish(
+    session_id: str,
+    workspace: str,
+    action: str = "accept",
+    learned_facts: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    """Finalize a session, apply or discard changes, update SQLite memory, and delete worktrees.
+
+    Args:
+        session_id: The session ID returned by harness2_solve.
+        workspace: Path to the target git repository.
+        action: 'accept' (applies diff to repository and records memory) or 'discard' (cleans up without changes).
+        learned_facts: Optional list of facts to record into SQLite long-term memory (e.g. [{'category': 'arch', 'fact': '...'}, ...]).
+    """
+    ws = Path(workspace).expanduser().resolve()
+    db = MemoryDB(ws / ".harness2" / "memory.db")
+    wt_mgr = WorktreeManager(ws)
+
+    session = db.get_session(session_id)
+    if not session:
+        return {"status": "error", "message": f"Session {session_id} not found."}
+
+    applied = False
+    if action == "accept":
+        # Find winning rollout or latest rollout
+        rollouts = session.get("rollouts", [])
+        if rollouts:
+            best_label = rollouts[-1]["label"]
+            wt_mgr.apply_to_repo(session_id, best_label)
+            applied = True
+
+        # Store durable facts into SQLite
+        if learned_facts:
+            for item in learned_facts:
+                if "category" in item and "fact" in item:
+                    db.add_longterm_fact(
+                        category=item["category"],
+                        fact=item["fact"],
+                        confidence=float(item.get("confidence", 1.0)),
+                        evidence=item.get("evidence"),
+                    )
+
+        db.close_session(session_id, status="accepted")
+    else:
+        db.close_session(session_id, status="discarded")
+
+    # Prune and delete all worktrees associated with this session
+    cleaned_worktrees = wt_mgr.cleanup_session(session_id)
+
+    return {
+        "status": "finished",
+        "action": action,
+        "applied_to_repository": applied,
+        "deleted_worktrees": cleaned_worktrees,
+    }
+
+
+@server.tool()
+def harness2_query_memory(
+    workspace: str,
+    category: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Query persistent SQLite long-term memory and recent sessions for a workspace.
+
+    Args:
+        workspace: Path to the git repository workspace.
+        category: Optional category filter (e.g. 'architecture', 'conventions', 'quirks').
+    """
+    ws = Path(workspace).expanduser().resolve()
+    db_file = ws / ".harness2" / "memory.db"
+    if not db_file.is_file():
+        return {"status": "empty", "message": "No SQLite memory database found in this workspace."}
+
+    db = MemoryDB(db_file)
+    facts = db.query_longterm_memory(category)
+    return {
+        "workspace": str(ws),
+        "total_facts": len(facts),
+        "facts": facts,
+        "markdown_summary": db.render_longterm_memory_markdown(),
     }
 
 

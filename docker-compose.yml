@@ -1,0 +1,16 @@
+services:
+  harness2-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: harness2-mcp
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./runs:/app/runs
+      - .:/workspace
+    environment:
+      - PYTHONUNBUFFERED=1
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT:-}
+      - GOOGLE_CLOUD_LOCATION=${GOOGLE_CLOUD_LOCATION:-global}
+    restart: unless-stopped
