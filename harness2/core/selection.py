@@ -348,11 +348,22 @@ def run_selection(
             raise ValueError("no ```choice block in the reply")
         anon = m.group(1).strip()
         if anon not in sel.id_map:
-            raise ValueError(f"chose {anon!r}, which is not one of {ids}")
+            # A selector that answers with a rollout's own label instead of
+            # its anonymous id has still made a choice -- and if the label is
+            # in the pool, that choice is unambiguous. Accept it rather than
+            # discarding a decision the model did make.
+            label = anon
+            if label not in pool:
+                raise ValueError(f"chose {anon!r}, which is not one of {ids}")
+            sel.chosen_id = next(
+                (a for a, lbl in sel.id_map.items() if lbl == label), ""
+            )
+        else:
+            sel.chosen_id = anon
+            label = sel.id_map[anon]
         w = _WHY.search(reply.text)
         sel.why = (w.group(1).strip() if w else "")[:2000]
-        sel.chosen_id = anon
-        sel.chosen_label = sel.id_map[anon]
+        sel.chosen_label = label
         sel.ok = True
     except (ProposerError, ValueError) as exc:
         if isinstance(exc, ProposerError):

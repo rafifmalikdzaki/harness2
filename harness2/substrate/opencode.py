@@ -92,6 +92,17 @@ OPENCODE_SURFACE = SurfaceSpec(
 
 OUTPUT_TOKEN_MAX = 64_000
 
+# OpenCode's own session and worktree tools. They can move a session to
+# another directory or register a worktree of another repository, so they
+# cross the workspace boundary without touching a path. They are denied for
+# every rollout, including one that opts into the operator's MCP servers.
+OPENCODE_OWN_TOOLS = (
+    "opencode_session_move",
+    "opencode_worktree_create",
+    "opencode_worktree_remove",
+    "opencode_worktree_list",
+)
+
 _OC_INSTALL_MODES = ("workspace_agents_md", "home_dir_jinja", "workspace_config")
 
 _JINJA_PLACEHOLDER = "{{ instruction }}"
@@ -190,11 +201,44 @@ def _permission_v1(workspace: Path) -> str:
     )
 
 
-def _permission_v2(workspace: Path) -> str:
-    """The V2 fence: the same boundary, in the shape V2 configuration expects."""
-    return json.dumps(
-        {"permissions": [{"action": "external_directory", "resource": "*", "effect": "deny"}]}
-    )
+def _fence_v2(workspace: Path, *, allow_mcp: bool = False) -> str:
+    """The V2 fence: the workspace boundary, plus the tools that cross it.
+
+    A path fence is not a boundary on its own. Three things reach outside a
+    workspace without touching a path:
+
+    * the **MCP servers** the user has configured globally -- a rollout
+      would inherit whatever the user's own OpenCode has, including servers
+      that hold credentials. A rollout is a program being run against
+      someone's repository; it must not inherit the operator's integrations.
+    * **Code Mode** (``execute``), which reaches every MCP tool by a second
+      route, so denying the MCP tools alone would not close it.
+    * OpenCode's own **session and worktree tools**, which can move the
+      session to another directory or register a worktree of another
+      repository -- the way a rollout ends up writing into a project it was
+      never given.
+
+    So the fence denies the inherited servers, denies Code Mode, denies
+    OpenCode's own session and worktree tools, and denies every path
+    outside the workspace. The remaining tools -- shell, read, edit, glob,
+    grep -- are what the rollout is supposed to use.
+
+    Opting into MCP (``allow_mcp``) gives up the inherited servers and Code
+    Mode, but never the session and worktree tools: those are OpenCode's
+    own escape hatch, not one of the operator's integrations.
+    """
+    document: dict[str, object] = {}
+    if not allow_mcp:
+        document["mcp"] = {"servers": {}}
+    permissions: list[dict[str, str]] = [
+        {"action": "external_directory", "resource": "*", "effect": "deny"},
+    ]
+    for tool in OPENCODE_OWN_TOOLS:
+        permissions.append({"action": tool, "resource": "*", "effect": "deny"})
+    if not allow_mcp:
+        permissions.insert(0, {"action": "execute", "resource": "*", "effect": "deny"})
+    document["permissions"] = permissions
+    return json.dumps(document)
 
 
 def opencode_command(
@@ -209,6 +253,8 @@ def opencode_command(
     opencode_dir: Path | None = None,
     bun: Path | None = None,
     binary: str | None = None,
+    allow_mcp: bool = False,
+    sandbox: bool = False,
 ) -> OpenCodeCommand:
     """Build the command for whichever OpenCode runtime is available.
 
@@ -218,6 +264,11 @@ def opencode_command(
     ``opencode`` binary is used instead; that build takes the fence as a V2
     configuration document, and carries the variant inside the model id
     rather than as a separate flag.
+
+    With ``sandbox`` the whole command is wrapped in a filesystem sandbox, so
+    the rollout cannot write outside the workspace or read the operator's
+    home -- the permission fence alone cannot promise that, because a shell
+    command runs with the operator's privileges.
     """
     oc_dir = Path(opencode_dir or config.OPENCODE_DIR)
     env = dict(os.environ)
@@ -258,6 +309,7 @@ def opencode_command(
             f"no OpenCode runtime: neither the pinned checkout at {oc_dir} "
             "(run scripts/setup_benchmark.py) nor an `opencode` binary on PATH"
         )
+    cwd = Path(workspace)
     argv = [
         resolved,
         "run",
@@ -283,8 +335,17 @@ def opencode_command(
     # model variant; V2 rejects both the variant and the effort for models
     # that do not offer them, so neither is forced here. A caller that wants
     # a named variant asks for it in the model id (provider/model#variant).
-    env["OPENCODE_CONFIG_CONTENT"] = _permission_v2(workspace)
-    return OpenCodeCommand(argv=argv, cwd=Path(workspace), env=env, kind="binary")
+    env["OPENCODE_CONFIG_CONTENT"] = _fence_v2(workspace, allow_mcp=allow_mcp)
+
+    if sandbox:
+        from ..adapters.sandbox import sandbox_argv, sandbox_env
+
+        argv = sandbox_argv(workspace, executable=resolved) + argv
+        env = sandbox_env(workspace, env=env)
+        # The sandboxed process starts in the workspace.
+        cwd = Path(workspace)
+
+    return OpenCodeCommand(argv=argv, cwd=cwd, env=env, kind="binary")
 
 
 class OpencodeSubstrate:

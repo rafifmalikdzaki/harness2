@@ -1,0 +1,145 @@
+"""Running a rollout inside a filesystem sandbox.
+
+A rollout is a model-driven program with the operator's authority. The
+permission fence tells OpenCode what the session may do; it does not change
+what the *process* may do. A shell command runs with the operator's
+filesystem privileges, and OpenCode's own directory inference is documented
+as best-effort -- a rollout that guesses an absolute path can write outside
+its workspace, and can read the operator's credentials.
+
+``bwrap`` (bubblewrap) closes that gap at the kernel level: the rollout sees
+a filesystem in which only its workspace is writable, and the operator's
+home directory does not exist.
+
+What is exposed, and why:
+
+* the **workspace** -- read-write, it is the rollout's own;
+* the **system directories** (``/usr``, ``/bin``, ``/lib``, ``/etc``, ...) --
+  read-only, because the agent needs a shell, a Python, and a git;
+* OpenCode's own **state** directory -- read-write, because that is where it
+  keeps its credentials and its session database;
+* the OpenCode **binary** -- read-only.
+
+Everything else, the operator's home directory included, is absent. The
+agent cannot read the SSH keys, the token store, or the shell history, and
+cannot write outside its workspace.
+
+Network access is deliberately *not* unshared: the rollout has to reach the
+model provider.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+from pathlib import Path
+
+__all__ = ["sandbox_available", "sandbox_argv", "sandbox_state_dirs"]
+
+# Read-only system paths the agent needs for a shell, an interpreter and git.
+_SYSTEM_PATHS = (
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/etc",
+    "/opt",
+    "/var",
+    "/srv",
+)
+
+# Where OpenCode keeps the credentials and the session database it needs to
+# make a model call. Read-write: it writes there during the run.
+_STATE_DIR = Path.home() / ".local" / "share" / "opencode"
+
+
+def sandbox_available() -> bool:
+    """Is a usable sandbox on this machine?"""
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        return False
+    if not _STATE_DIR.is_dir():
+        return False
+    # bwrap fails inside a container that forbids user namespaces.
+    try:
+        import subprocess
+
+        probe = subprocess.run(
+            [bwrap, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "/bin/true"],
+            capture_output=True,
+            timeout=20,
+        )
+    except Exception:
+        return False
+    return probe.returncode == 0
+
+
+def sandbox_state_dirs(executable: str | Path | None = None) -> list[Path]:
+    """The directories that must stay visible for OpenCode to run.
+
+    Two of them: the directory the OpenCode binary is installed in, and the
+    state directory where OpenCode keeps its credentials and its session
+    database. Both are read-write for the state, read-only for the binary.
+    """
+    dirs: list[Path] = []
+    if executable:
+        exe = Path(executable).resolve()
+        if exe.is_file():
+            dirs.append(exe.parent)
+    if _STATE_DIR.is_dir():
+        dirs.append(_STATE_DIR)
+    return dirs
+
+
+def sandbox_argv(
+    workspace: Path, *, home: Path | None = None, executable: str | Path | None = None
+) -> list[str]:
+    """The ``bwrap`` prefix that confines a run to ``workspace``.
+
+    The filesystem is assembled from scratch: the system directories are
+    bound read-only, the operator's home is replaced by an empty tmpfs, the
+    OpenCode binary and state are bound back in so the model call can
+    authenticate, and the workspace is bound read-write. The network
+    namespace is left alone on purpose -- the rollout has to reach the model
+    provider.
+    """
+    bwrap = shutil.which("bwrap") or "bwrap"
+    ws = Path(workspace).resolve()
+    home_dir = Path(home or Path.home()).resolve()
+
+    argv: list[str] = [bwrap]
+    for path in _SYSTEM_PATHS:
+        if Path(path).exists():
+            argv += ["--ro-bind", path, path]
+    argv += ["--dev", "/dev", "--proc", "/proc"]
+    # A private /tmp: the rollout gets a scratch space, and cannot see or
+    # disturb anything another process left there.
+    argv += ["--tmpfs", "/tmp"]
+    # The operator's home does not exist inside the sandbox.
+    argv += ["--tmpfs", str(home_dir)]
+    for state in sandbox_state_dirs(executable):
+        argv += ["--bind", str(state), str(state)]
+    # The workspace is the one writable place. It is bound after the tmpfs
+    # mounts, so it is re-exposed even when it lives under one of them --
+    # the proposer's working directory is a scratch directory in /tmp.
+    argv += ["--bind", str(ws), str(ws)]
+    argv += ["--chdir", str(ws)]
+    return argv
+
+
+def sandbox_env(
+    workspace: Path, *, home: Path | None = None, env: dict[str, str] | None = None
+) -> dict[str, str]:
+    """The environment a sandboxed rollout needs.
+
+    ``HOME`` still points at the real home: OpenCode resolves its own state
+    directory from it, and that directory is bound into the sandbox
+    explicitly. Nothing else about the home is reachable.
+    """
+    home_dir = Path(home or Path.home()).resolve()
+    out = dict(env if env is not None else os.environ)
+    out["HOME"] = str(home_dir)
+    out.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    return out

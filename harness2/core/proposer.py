@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import config
+from ..adapters.sandbox import sandbox_available
 from ..substrate.opencode import opencode_command
 from .spec import ChannelSpec
 
@@ -272,6 +273,11 @@ class Proposer:
             model=self.spec.model,
             title="propose",
             variant=self.spec.effort,
+            # The proposer's working directory is a scratch directory holding
+            # the evidence it must read. It is sandboxed for the same reason
+            # the solver is: a relative write must not land outside it, and
+            # the operator's home must not be readable.
+            sandbox=sandbox_available(),
         )
         env.update(command.env)
         if command.kind == "source":

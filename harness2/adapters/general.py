@@ -27,6 +27,7 @@ from ..core.spec import BenchPrompts, BenchSpec, ChannelSpec
 from ..substrate.base import Install, RunRequest
 from ..substrate.opencode import OpencodeSubstrate
 from .general_runner import run_opencode_in_workspace, stage_harness
+from .sandbox import sandbox_available
 from .worktree import WorktreeManager
 
 __all__ = ["GeneralTaskAdapter"]
@@ -56,6 +57,8 @@ class GeneralTaskAdapter:
         model: str = "",
         selector_model: str = "",
         timeout: int = 1800,
+        allow_mcp: bool = False,
+        sandbox: bool = True,
     ):
         self.repo_root = Path(repo_root).expanduser().resolve()
         self.goal = goal.strip()
@@ -68,6 +71,14 @@ class GeneralTaskAdapter:
         # fails the selection session with "Model unavailable".
         self.selector_model = (selector_model or model).strip()
         self.timeout = int(timeout)
+        # A rollout does not inherit the operator's MCP servers by default:
+        # they may hold credentials, and they are a route out of the
+        # workspace that a path fence does not close.
+        self.allow_mcp = bool(allow_mcp)
+        # And it runs in a filesystem sandbox where the operator's home does
+        # not exist, so a shell command cannot write outside the workspace or
+        # read the operator's keys.
+        self.sandbox = bool(sandbox) and sandbox_available()
 
         # Internal state lives in .harness2 inside the repo; keep it ignored.
         self.harness_dir = self.repo_root / ".harness2"
@@ -181,6 +192,8 @@ class GeneralTaskAdapter:
                 model=self.model,
                 title=f"general | {req.task_ref}",
                 timeout=timeout,
+                allow_mcp=self.allow_mcp,
+                sandbox=self.sandbox,
             )
             return [rollout.trajectory.parent]
 
@@ -198,6 +211,7 @@ class GeneralTaskAdapter:
         label = run_id.replace("/", "__")
         wt_path = self.wt_mgr.create(self.session_id, label)
         wall = int(timeout or self.timeout)
+        before = self._tree_state()
 
         active = harness_dir or self.base_harness()
         install = self.substrate.materialise(active, self.spec, {})
@@ -210,6 +224,14 @@ class GeneralTaskAdapter:
         # The harness's own files are scaffolding, not the agent's work.
         authored = self._authored_paths(wt_path)
         git_diff = self.wt_mgr.get_diff(self.session_id, label, exclude=authored)
+
+        # The fence is a boundary on paths, not a guarantee: OpenCode's own
+        # session and worktree tools can relocate a session or register a
+        # worktree of another repository, and the shell runs with the
+        # operator's authority. So the rollout is also checked afterwards,
+        # and anything it left outside its worktree is reported rather than
+        # discovered later.
+        leaks = self._detect_leaks(wt_path, before)
 
         test_passed = None
         test_output = ""
@@ -243,6 +265,8 @@ class GeneralTaskAdapter:
         (run_dir / "diff.patch").write_text(git_diff, encoding="utf-8")
         (run_dir / "test_output.txt").write_text(test_output, encoding="utf-8")
         (run_dir / "worktree_path.txt").write_text(str(wt_path), encoding="utf-8")
+        if leaks:
+            (run_dir / "leaks.txt").write_text("\n".join(leaks) + "\n", encoding="utf-8")
         traj = wt_path / ".harness_traj" / "trajectory.jsonl"
         if traj.is_file():
             (run_dir / "trajectory.jsonl").write_text(
@@ -256,6 +280,88 @@ class GeneralTaskAdapter:
         if not marker.is_file():
             return []
         return [ln for ln in marker.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+    def _detect_leaks(self, worktree: Path, before: set[str]) -> list[str]:
+        """What the rollout left outside its own worktree.
+
+        The worktree is a git worktree of the user's repository, so a write
+        outside it is either in the user's tree or in some other repository
+        entirely -- the case that produced a stray ``fix-calc/`` directory
+        inside the harness's own checkout.
+
+        Two things are checked:
+
+        * the **worktree registry** of the user's repository, for entries
+          that appeared during the rollout;
+        * the **user's own working tree**, for files that appeared during
+          the rollout. The state before the rollout is subtracted, so the
+          harness's own housekeeping (the ``.gitignore`` entry it adds, for
+          instance) is not mistaken for a leak.
+
+        The check is a report, not a prevention: the fence has already
+        denied the paths it can see. This catches the paths it cannot.
+        """
+        leaks: list[str] = []
+        try:
+            leaks.extend(self._leaked_worktrees(worktree))
+        except Exception:
+            pass
+        try:
+            leaks.extend(self._leaked_files(before))
+        except Exception:
+            pass
+        return leaks
+
+    def _tree_state(self) -> set[str]:
+        """The paths the user's working tree currently reports as changed."""
+        try:
+            res = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=self.repo_root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except Exception:
+            return set()
+        return {ln[3:].strip() for ln in res.stdout.splitlines() if len(ln) >= 4}
+
+    def _leaked_worktrees(self, worktree: Path) -> list[str]:
+        """Worktrees registered against the user's repository, outside ours."""
+        out: list[str] = []
+        try:
+            res = subprocess.run(
+                ["git", "worktree", "list", "--porcelain"],
+                cwd=self.repo_root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except Exception:
+            return out
+        ours = str(worktree.resolve())
+        for line in res.stdout.splitlines():
+            if not line.startswith("worktree "):
+                continue
+            path = line[len("worktree ") :].strip()
+            if path == ours or str(self.repo_root) == path:
+                continue
+            # A worktree of the user's repo that is not ours, and that is not
+            # one of the harness's own rollouts.
+            if path.startswith(str(self.harness_dir.resolve())):
+                continue
+            if "harness2" in path or "harness2-prop" in path:
+                continue
+            out.append(f"worktree registered outside the rollout: {path}")
+        return out
+
+    def _leaked_files(self, before: set[str]) -> list[str]:
+        """Files in the user's working tree that the rollout added."""
+        return [
+            f"file in the user's tree: {name}"
+            for name in sorted(self._tree_state() - before)
+            if not name.startswith(".harness")
+        ]
 
     # ------------------------------------------------------------------
     # evidence

@@ -26,7 +26,6 @@ shared across concurrent rollouts.
 
 from __future__ import annotations
 
-import json
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -72,25 +71,6 @@ class OpenCodeRuntime:
     env: dict[str, str]
 
 
-def _v1_permission(workspace: Path, extra: list[str] | None) -> str:
-    """The V1 fence: deny everything outside the workspace."""
-    allow = {"*": "deny", str(workspace): "allow", f"{workspace}/**": "allow"}
-    for root in extra or []:
-        allow[str(root)] = "allow"
-        allow[f"{root}/**"] = "allow"
-    return json.dumps({"external_directory": allow})
-
-
-def _v2_permission(workspace: Path, extra: list[str] | None) -> str:
-    """The V2 fence: the same boundary, in the shape V2 config expects."""
-    rules: list[dict[str, str]] = [
-        {"action": "external_directory", "resource": "*", "effect": "deny"},
-    ]
-    for root in extra or []:
-        rules.append({"action": "external_directory", "resource": f"{root}/*", "effect": "allow"})
-    return json.dumps({"permissions": rules})
-
-
 def resolve_runtime(
     *,
     workspace: Path,
@@ -101,6 +81,8 @@ def resolve_runtime(
     bun: Path | None = None,
     opencode_bin: str | None = None,
     extra_allowed: list[str] | None = None,
+    allow_mcp: bool = False,
+    sandbox: bool = False,
 ) -> OpenCodeRuntime:
     """Pick the OpenCode runtime and build the argv for it.
 
@@ -116,6 +98,8 @@ def resolve_runtime(
         opencode_dir=opencode_dir,
         bun=bun,
         binary=opencode_bin,
+        allow_mcp=allow_mcp,
+        sandbox=sandbox,
     )
     return OpenCodeRuntime(
         kind=command.kind,
@@ -167,6 +151,8 @@ def run_opencode_in_workspace(
     bun: Path | None = None,
     opencode_bin: str | None = None,
     extra_allowed: list[str] | None = None,
+    allow_mcp: bool = False,
+    sandbox: bool = False,
 ) -> GeneralRollout:
     """Run one OpenCode session in ``workspace`` and capture its event stream."""
     runtime = resolve_runtime(
@@ -178,6 +164,8 @@ def run_opencode_in_workspace(
         bun=bun,
         opencode_bin=opencode_bin,
         extra_allowed=extra_allowed,
+        allow_mcp=allow_mcp,
+        sandbox=sandbox,
     )
 
     traj_dir = workspace / ".harness_traj"

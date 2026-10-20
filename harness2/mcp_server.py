@@ -464,6 +464,8 @@ def harness2_recursion(
     domain: str = "general",
     verify_cmd: Optional[str] = None,
     timeout: int = 1800,
+    allow_mcp: bool = False,
+    sandbox: bool = True,
 ) -> Dict[str, Any]:
     """Run the real Propose-Probe-Compose loop on a repository and goal.
 
@@ -488,6 +490,12 @@ def harness2_recursion(
         verify_cmd: Optional verification command; a rollout that passes it is
             preferred when selecting.
         timeout: Per-rollout timeout in seconds.
+        sandbox: Run each rollout in a filesystem sandbox, so a shell command
+            cannot write outside the workspace or read your home directory.
+            On by default; needs bwrap on the machine.
+        allow_mcp: Let the rollout use the MCP servers configured in your
+            OpenCode. Off by default: they may hold credentials, and they are
+            a route out of the workspace that a path fence does not close.
     """
     ws = Path(workspace).expanduser().resolve()
     if not (ws / ".git").exists():
@@ -524,6 +532,8 @@ def harness2_recursion(
         model=solver_model,
         selector_model=improver_model,
         timeout=timeout,
+        allow_mcp=allow_mcp,
+        sandbox=sandbox,
     )
     proposer = Proposer(resolve_channel_model("opencode", improver_model))
     library_root = adapter.harness_dir / "library" / f"k{k}"

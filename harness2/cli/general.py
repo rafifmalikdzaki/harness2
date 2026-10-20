@@ -57,6 +57,25 @@ def main(argv=None) -> int:
     parser.add_argument("--improver-model", default=None, help="Proposer/selector model (default: HARNESS2_IMPROVER_MODEL)")
     parser.add_argument("--timeout", type=int, default=1800, help="Per-rollout timeout in seconds")
     parser.add_argument("--runs-root", type=Path, default=None, help="Where run artifacts go (default: <workspace>/.harness2/runs)")
+    parser.add_argument(
+        "--no-sandbox",
+        action="store_true",
+        help=(
+            "Run the rollout without the filesystem sandbox. The sandbox is "
+            "what keeps a shell command from writing outside the workspace or "
+            "reading your home directory; it is on by default when bwrap is "
+            "available."
+        ),
+    )
+    parser.add_argument(
+        "--allow-mcp",
+        action="store_true",
+        help=(
+            "Let the rollout use the MCP servers configured in your OpenCode. "
+            "Off by default: they may hold credentials, and they are a route out "
+            "of the workspace that a path fence does not close."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.k < 1:
@@ -90,6 +109,8 @@ def main(argv=None) -> int:
         model=solver_model,
         selector_model=improver_model,
         timeout=args.timeout,
+        allow_mcp=args.allow_mcp,
+        sandbox=not args.no_sandbox,
     )
 
     channel = resolve_channel_model("opencode", improver_model)
