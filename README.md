@@ -57,6 +57,7 @@ https://github.com/user-attachments/assets/76b10548-b14b-4c8f-9aa5-a93662df4d56
 - [Harness components](#harness-components)
 - [Install](#install)
 - [Run a benchmark](#run-a-benchmark)
+- [Model Context Protocol (MCP) Integration](#model-context-protocol-mcp-integration)
 - [Experiments](#experiments)
 - [Web access](#web-access)
 - [Results and resume](#results-and-resume)
@@ -136,6 +137,65 @@ Choose one benchmark per command. WorkBuddy also takes `--subset office`,
 `--subset web`, or `--subset code` on every command after setup. The
 [benchmark guides](docs/BENCHMARKS.md) cover each one's data, domains, and
 grading.
+
+## Model Context Protocol (MCP) Integration
+
+Harness² includes an official **MCP Server** that exposes recursive agent harnessing capabilities, domain experience library queries, and harness materialization to external coding agents (**Claude Code**, **OpenCode**, **Codex**, and **Antigravity**).
+
+### Start the Server Directly
+
+```bash
+# Via CLI entrypoint
+harness2-mcp
+
+# Or via Python module
+python -m harness2.mcp_server
+```
+
+### Client Configuration
+
+Add the server to your agent's configuration:
+
+```json
+{
+  "mcpServers": {
+    "harness2": {
+      "command": "/path/to/harness2/.venv/bin/python",
+      "args": ["/path/to/harness2/harness2/mcp_server.py"]
+    }
+  }
+}
+```
+
+Config paths:
+- **Claude Code**: `~/.claude.json` or run `claude mcp add harness2 -- <path-to-venv-python> <path-to-mcp_server.py>`
+- **OpenCode**: `~/.config/opencode/opencode.json` (under `mcp.servers`)
+- **Codex CLI**: `~/.codex/config.json`
+- **Antigravity (`agy`)**: `~/.gemini/config/mcp_config.json`
+
+### Natural Language Examples (Prompts for Your Agent)
+
+Once connected, your coding agent can invoke Harness² tools directly in response to natural language prompts:
+
+#### 1. Running an Offline Recursion Demo
+> *"Run the Harness2 demo with budget k=2 in both parallel and sequential modes, and show me the execution count and task completion status."*
+- Calls `harness2_run_demo(k=2, mode="both")`.
+- Demonstrates task-level Propose–Probe–Compose steps on synthetic ledger tasks without making external model calls.
+
+#### 2. Querying Discovered Domain Knowledge
+> *"Inspect the Harness2 experience library for the 'accounting' domain. What cues, lessons, and scripts did past tasks discover?"*
+- Calls `harness2_inspect_library(domain="accounting")`.
+- Returns recorded heuristics (e.g. handling credit/debit signs) and synthesized scripts/skills.
+
+#### 3. Materializing Synthesized Harnesses into Your Active Workspace
+> *"Apply the synthesized accounting harness to my current workspace."*
+- Calls `harness2_apply_harness(harness_path="...", target_workspace=".")`.
+- Automatically maps components to the client's preferred conventions (`AGENTS.md` for Codex, `.gemini/rules/` and `.gemini/skills/` for Antigravity, or `systemprompt.md` for OpenCode).
+
+#### 4. Checking Benchmark Readiness
+> *"Check if the LAB and JobBench benchmarks are installed and ready for evaluation under OpenCode."*
+- Calls `harness2_benchmark_status(bench="lab", substrate="oc")`.
+- Validates pinned dependencies and environment health before starting benchmark sweeps.
 
 ## Experiments
 
