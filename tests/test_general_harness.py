@@ -42,9 +42,33 @@ def test_adapter_satisfies_the_benchmark_protocol(tmp_path):
     assert adapter.tasks() == [adapter.session_id]
     assert adapter.domain_of(adapter.session_id) == "general"
     assert "make it better" in adapter.task_prompt(adapter.session_id)
-    assert adapter.task_files(adapter.session_id) == adapter.repo_root
     assert adapter.base_harness().is_dir()
     adapter.validate_tree({})
+
+
+def test_the_source_room_is_bounded_not_the_repository(tmp_path):
+    """The evidence tree is built once per stage.
+
+    A repository under research can hold a dataset the size of a disk, and
+    the general path's task *is* the repository -- so handing the whole
+    tree to the evidence builder duplicates the disk once per stage.
+    """
+    repo = make_repo(tmp_path)
+    # Something big, and something binary.
+    (repo / "big.bin").write_bytes(b"\0" * 2_000_000)
+    (repo / "notes.txt").write_text("some prose\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "more"], cwd=repo, check=True)
+
+    adapter = GeneralTaskAdapter(repo_root=repo, goal="x")
+    room = adapter.task_files(adapter.session_id)
+    assert room is not None
+    assert room != adapter.repo_root
+    assert room.is_relative_to(adapter.harness_dir)
+    names = {p.name for p in room.rglob("*") if p.is_file()}
+    assert "notes.txt" in names
+    # The binary is not text, so it is not copied.
+    assert "big.bin" not in names
 
 
 def test_base_harness_validates_against_the_opencode_surface(tmp_path):

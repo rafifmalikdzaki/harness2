@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
+from typing import Sequence
 
 __all__ = ["sandbox_available", "sandbox_argv", "sandbox_state_dirs"]
 
@@ -94,7 +95,11 @@ def sandbox_state_dirs(executable: str | Path | None = None) -> list[Path]:
 
 
 def sandbox_argv(
-    workspace: Path, *, home: Path | None = None, executable: str | Path | None = None
+    workspace: Path,
+    *,
+    home: Path | None = None,
+    executable: str | Path | None = None,
+    extra_readonly: Sequence[tuple[Path, Path]] = (),
 ) -> list[str]:
     """The ``bwrap`` prefix that confines a run to ``workspace``.
 
@@ -104,6 +109,14 @@ def sandbox_argv(
     authenticate, and the workspace is bound read-write. The network
     namespace is left alone on purpose -- the rollout has to reach the model
     provider.
+
+    ``extra_readonly`` names (source, target) paths the rollout needs to
+    *read* but must not write. The project's own checkout, with its
+    virtualenv and its installed tooling, is the usual case: a project under
+    development is exactly what the rollout is working on, so reading it is
+    expected; writing to it is what has to be fenced. A target may differ
+    from its source, which is how a virtualenv in the main checkout is
+    presented at the path a worktree expects to find it.
     """
     bwrap = shutil.which("bwrap") or "bwrap"
     ws = Path(workspace).resolve()
@@ -121,10 +134,31 @@ def sandbox_argv(
     argv += ["--tmpfs", str(home_dir)]
     for state in sandbox_state_dirs(executable):
         argv += ["--bind", str(state), str(state)]
+    before: list[tuple[Path, Path]] = []
+    after: list[tuple[Path, Path]] = []
+    for source, target in extra_readonly:
+        src = Path(source).resolve()
+        if not src.is_dir():
+            continue
+        dst = Path(target)
+        # A mount that *contains* the workspace has to come first, or it
+        # would make the workspace read-only; a mount that *is inside* the
+        # workspace has to come after, or the workspace's own mount would
+        # hide it.
+        if dst == ws or ws.is_relative_to(dst):
+            before.append((src, dst))
+        else:
+            after.append((src, dst))
+    for src, dst in before:
+        argv += ["--ro-bind", str(src), str(dst)]
     # The workspace is the one writable place. It is bound after the tmpfs
     # mounts, so it is re-exposed even when it lives under one of them --
-    # the proposer's working directory is a scratch directory in /tmp.
+    # the proposer's working directory is a scratch directory in /tmp, and
+    # the general path's workspace is a worktree inside the project's own
+    # checkout.
     argv += ["--bind", str(ws), str(ws)]
+    for src, dst in after:
+        argv += ["--ro-bind", str(src), str(dst)]
     argv += ["--chdir", str(ws)]
     return argv
 

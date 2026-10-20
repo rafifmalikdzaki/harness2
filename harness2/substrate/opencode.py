@@ -33,7 +33,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from .. import config
 from ..core import runmark as RM
@@ -255,6 +255,7 @@ def opencode_command(
     binary: str | None = None,
     allow_mcp: bool = False,
     sandbox: bool = False,
+    sandbox_readonly: Sequence[tuple[Path, Path]] = (),
 ) -> OpenCodeCommand:
     """Build the command for whichever OpenCode runtime is available.
 
@@ -340,7 +341,9 @@ def opencode_command(
     if sandbox:
         from ..adapters.sandbox import sandbox_argv, sandbox_env
 
-        argv = sandbox_argv(workspace, executable=resolved) + argv
+        argv = sandbox_argv(
+            workspace, executable=resolved, extra_readonly=sandbox_readonly
+        ) + argv
         env = sandbox_env(workspace, env=env)
         # The sandboxed process starts in the workspace.
         cwd = Path(workspace)

@@ -188,8 +188,22 @@ def build(
     )
 
 
+# A task's source material is a data room, not a disk. The copy is bounded
+# so that no adapter -- and in particular the general path, whose task *is*
+# a repository -- can fill the machine by copying a tree into every stage.
+_MAX_SOURCE_FILE_BYTES = 1_000_000
+_MAX_SOURCE_BYTES = 64_000_000
+
+
 def copy_source(adapter: BenchmarkAdapter, task_id: str, root: Path) -> int:
-    """Copy the task's source material under `root`, minus answer-key paths."""
+    """Copy the task's source material under `root`, minus answer-key paths.
+
+    The copy is bounded: a task's materials are supposed to be a data room,
+    and a repository that happens to hold a dataset the size of a disk is
+    not one. Without the bound, the general path -- whose task *is* a
+    repository -- copies the whole tree into every stage's evidence, once
+    per stage.
+    """
     src_fn = getattr(adapter, "task_files", None)
     if not callable(src_fn):
         return 0
@@ -198,9 +212,18 @@ def copy_source(adapter: BenchmarkAdapter, task_id: str, root: Path) -> int:
         return 0
     dst = root / "source"
     src_n = 0
+    total = 0
     for f in sorted(Path(src).rglob("*")):
         if not f.is_file() or "__pycache__" in f.parts:
             continue
+        try:
+            size = f.stat().st_size
+        except OSError:
+            continue
+        if size > _MAX_SOURCE_FILE_BYTES:
+            continue
+        if total + size > _MAX_SOURCE_BYTES:
+            break
         rel = f.relative_to(src).as_posix()
         if any(
             fnmatch.fnmatch(rel, g.lstrip("./")) or fnmatch.fnmatch(rel, f"*/{g.lstrip('./')}")
@@ -210,6 +233,7 @@ def copy_source(adapter: BenchmarkAdapter, task_id: str, root: Path) -> int:
         t = dst / rel
         t.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(f, t)
+        total += size
         src_n += 1
     if src_n:
         assert_no_leak_paths(dst, adapter.spec.leak_globs)

@@ -30,6 +30,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Sequence
 
 from ..substrate.opencode import opencode_command
 from ..substrate.render import render_opencode_tree
@@ -83,6 +84,7 @@ def resolve_runtime(
     extra_allowed: list[str] | None = None,
     allow_mcp: bool = False,
     sandbox: bool = False,
+    sandbox_readonly: Sequence[tuple[Path, Path]] = (),
 ) -> OpenCodeRuntime:
     """Pick the OpenCode runtime and build the argv for it.
 
@@ -100,6 +102,7 @@ def resolve_runtime(
         binary=opencode_bin,
         allow_mcp=allow_mcp,
         sandbox=sandbox,
+        sandbox_readonly=sandbox_readonly,
     )
     return OpenCodeRuntime(
         kind=command.kind,
@@ -153,6 +156,7 @@ def run_opencode_in_workspace(
     extra_allowed: list[str] | None = None,
     allow_mcp: bool = False,
     sandbox: bool = False,
+    sandbox_readonly: Sequence[tuple[Path, Path]] = (),
 ) -> GeneralRollout:
     """Run one OpenCode session in ``workspace`` and capture its event stream."""
     runtime = resolve_runtime(
@@ -166,6 +170,7 @@ def run_opencode_in_workspace(
         extra_allowed=extra_allowed,
         allow_mcp=allow_mcp,
         sandbox=sandbox,
+        sandbox_readonly=sandbox_readonly,
     )
 
     traj_dir = workspace / ".harness_traj"

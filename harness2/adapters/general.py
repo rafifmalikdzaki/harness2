@@ -19,7 +19,7 @@ import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 from ..core import tree
 from ..core.memory_db import MemoryDB
@@ -31,6 +31,13 @@ from .sandbox import sandbox_available
 from .worktree import WorktreeManager
 
 __all__ = ["GeneralTaskAdapter"]
+
+
+# The source room the improver reads: the repository's tracked text files,
+# bounded. A repository under research can hold a dataset the size of a
+# disk, and the evidence tree is built once per stage.
+_SOURCE_ROOM_BYTES = 32_000_000
+_SOURCE_ROOM_FILE_BYTES = 500_000
 
 
 def _ensure_gitignore_has(repo: Path, entry: str) -> None:
@@ -70,6 +77,8 @@ class GeneralTaskAdapter:
         # builds the selector's proposer from it, and a placeholder there
         # fails the selection session with "Model unavailable".
         self.selector_model = (selector_model or model).strip()
+        # The verification verdict per rollout label, recorded as it ran.
+        self._verdicts: dict[str, bool] = {}
         self.timeout = int(timeout)
         # A rollout does not inherit the operator's MCP servers by default:
         # they may hold credentials, and they are a route out of the
@@ -159,7 +168,74 @@ class GeneralTaskAdapter:
         return prompt
 
     def task_files(self, task_id: str) -> Optional[Path]:
-        return self.repo_root
+        """The source room the improver reads.
+
+        For a general task the material *is* the repository -- but the
+        repository can hold a dataset the size of a disk, and the evidence
+        tree is built once per stage. So the room is prepared once: the
+        repository's tracked text files, bounded.
+        """
+        return self._source_room()
+
+    def _source_room(self) -> Optional[Path]:
+        """A bounded copy of the repository's tracked text files.
+
+        The rollout works in the repository itself, so this is not the
+        agent's material -- it is the improver's, so that a proposal can be
+        grounded in the code the rollout was working on rather than only in
+        the transcript.
+        """
+        room = self.harness_dir / "source_room"
+        marker = room / ".complete"
+        if marker.is_file():
+            return room if any(room.rglob("*")) else None
+        shutil.rmtree(room, ignore_errors=True)
+        room.mkdir(parents=True, exist_ok=True)
+        total = 0
+        for rel in self._tracked_text_files():
+            src = self.repo_root / rel
+            try:
+                size = src.stat().st_size
+            except OSError:
+                continue
+            if total + size > _SOURCE_ROOM_BYTES:
+                break
+            dst = room / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            total += size
+        marker.write_text(f"{total}\n", encoding="utf-8")
+        return room if total else None
+
+    def _tracked_text_files(self) -> list[str]:
+        """The repository's tracked files that are text and small enough."""
+        try:
+            res = subprocess.run(
+                ["git", "ls-files", "-z"],
+                cwd=self.repo_root,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except Exception:
+            return []
+        if res.returncode != 0:
+            return []
+        out: list[str] = []
+        for rel in res.stdout.split("\0"):
+            if not rel or rel.startswith(".harness"):
+                continue
+            p = self.repo_root / rel
+            try:
+                if not p.is_file() or p.stat().st_size > _SOURCE_ROOM_FILE_BYTES:
+                    continue
+                head = p.read_bytes()[:1024]
+            except OSError:
+                continue
+            if b"\0" in head:
+                continue  # binary
+            out.append(rel)
+        return out
 
     def base_harness(self) -> Path:
         return self.harness_dir / "base"
@@ -182,6 +258,13 @@ class GeneralTaskAdapter:
 
         def launch(req: RunRequest, install: Install) -> list[Path]:
             authored = stage_harness(install.staging_dir, worktree, self._render_ctx())
+            # The sandbox mounts the project's virtualenv at the path a
+            # worktree expects to find it, and bwrap creates that mount
+            # point on the real filesystem. It is scaffolding, like the
+            # harness files, so it must not read as the agent's work.
+            venv = worktree / ".venv"
+            if venv.is_dir():
+                authored.append(".venv")
             (worktree / ".harness_authored").write_text(
                 "\n".join(sorted(authored)), encoding="utf-8"
             )
@@ -194,6 +277,11 @@ class GeneralTaskAdapter:
                 timeout=timeout,
                 allow_mcp=self.allow_mcp,
                 sandbox=self.sandbox,
+                # The project's own checkout, read-only: the rollout needs
+                # its virtualenv and its installed tooling to run the
+                # project's tests. Writing to the checkout is what the
+                # sandbox forbids -- the worktree is where changes go.
+                sandbox_readonly=self._sandbox_readonly(worktree),
             )
             return [rollout.trajectory.parent]
 
@@ -251,6 +339,8 @@ class GeneralTaskAdapter:
                 test_passed = False
                 test_output = f"Execution error: {e}"
 
+        self._verdicts[label] = bool(test_passed)
+
         self.db.record_rollout(
             session_id=self.session_id,
             label=label,
@@ -273,6 +363,54 @@ class GeneralTaskAdapter:
                 traj.read_text(encoding="utf-8", errors="replace"), encoding="utf-8"
             )
         return run_dir
+
+    def _sandbox_readonly(self, worktree: Path) -> list[tuple[Path, Path]]:
+        """What the rollout may read but not write, and where it may read it.
+
+        The project's own checkout is readable: a rollout working on a
+        project needs to see it. Its virtualenv is presented at the path a
+        worktree expects to find it, because a worktree has no environment
+        of its own.
+
+        The interpreter behind that virtualenv is usually *not* in the
+        project -- a uv-managed CPython, a pyenv build, a conda prefix --
+        and it is reached through a symlink. The sandbox hides the
+        operator's home, so the target of that symlink is bound in as well;
+        without it the rollout's ``.venv/bin/python`` is a dangling link.
+        """
+        pairs: list[tuple[Path, Path]] = [(self.repo_root, self.repo_root)]
+        venv = self.repo_root / ".venv"
+        if not venv.is_dir():
+            return pairs
+        pairs.append((venv, worktree / ".venv"))
+        for interpreter in self._interpreters(venv):
+            if interpreter.is_dir() and interpreter not in {self.repo_root}:
+                pairs.append((interpreter, interpreter))
+        return pairs
+
+    def _interpreters(self, venv: Path) -> list[Path]:
+        """The real directories behind a virtualenv's python executables.
+
+        A uv-managed or pyenv interpreter is a whole installation, not a
+        single binary: it resolves its standard library relative to the
+        executable, so the prefix around it has to be bound in as well.
+        """
+        found: list[Path] = []
+        for name in ("python", "python3"):
+            link = venv / "bin" / name
+            if not link.is_symlink():
+                continue
+            try:
+                real = link.resolve(strict=True)
+            except OSError:
+                continue
+            if not real.is_file():
+                continue
+            # <prefix>/bin/python -> <prefix>
+            prefix = real.parent.parent if real.parent.name == "bin" else real.parent
+            if prefix not in found:
+                found.append(prefix)
+        return found
 
     def _authored_paths(self, worktree: Path) -> list[str]:
         """The harness-authored paths in this worktree, from the launcher's record."""
@@ -389,6 +527,28 @@ class GeneralTaskAdapter:
         """The agent's actual changes to the repository."""
         return (run_dir / "diff.patch").read_text(encoding="utf-8", errors="replace")
 
+    def deliverable_assets(self, run_dir: Path) -> list[Path]:
+        """The verifier's verdict on this candidate, as evidence for the selector.
+
+        A verification command is only useful if the selector can see it: a
+        candidate that passes and a candidate that fails look identical in
+        a diff. So the verdict travels with the candidate.
+        """
+        run_dir = Path(run_dir)
+        if not self.verify_cmd:
+            return []
+        out = run_dir / "test_output.txt"
+        return [out] if out.is_file() else []
+
+    def deliverable_assets_note(self, names: Sequence[str]) -> str:
+        """Say what the asset is, so the selector reads it as a verdict."""
+        return (
+            "<!-- the verification command's output for this candidate: "
+            + ", ".join(names)
+            + ". Read it before judging: a candidate whose verification failed "
+            "is not a candidate that solved the work. -->\n"
+        )
+
     def deliverable_files(self, run_dir: Path) -> Dict[str, str]:
         return {
             "diff.patch": self.deliverable_text(run_dir),
@@ -402,11 +562,18 @@ class GeneralTaskAdapter:
 
         No verifier means no grade: the judge path treats ``None`` as
         "unjudged", never as a zero.
+
+        The verdict is the verification command's **exit status**, recorded
+        when the rollout ran -- not a guess made from its output. A test
+        runner's output format is its own business; its exit status is not.
         """
         if not self.verify_cmd:
             return None
         passed = (run_dir / "test_output.txt").read_text(
             encoding="utf-8", errors="replace"
         )
-        ok = "(no failures)" in passed or passed.strip() == ""
+        ok = self._verdicts.get(Path(run_dir).name)
+        if ok is None:
+            # No recorded status: the command never ran. That is not a pass.
+            ok = False
         return {"n_passed": 1 if ok else 0, "n_criteria": 1, "detail": passed[:2000]}
