@@ -14,7 +14,7 @@
 
 """Harness² Model Context Protocol (MCP) Server.
 
-Exposes Harness² recursive harnessing capabilities, demo runner, and domain
+Exposes Harness² recursive agent harnessing capabilities, demo runner, and domain
 experience library inspection to Claude Code, Codex, OpenCode, and Antigravity (agy).
 """
 
@@ -38,7 +38,7 @@ server = MCPServer(
         "Harness² MCP Server: Automates recursive agent harnessing (Propose-Probe-Compose) "
         "and manages persistent domain experience libraries (skills, scripts, guardrails)."
     ),
-    version="0.1.0",
+    version="0.2.0",
 )
 
 
@@ -138,23 +138,44 @@ def harness2_inspect_library(
     }
 
 
+def _detect_workspace_format(dest: Path) -> str:
+    """Accurately detect the target agent framework convention."""
+    if (dest / ".opencode").is_dir() or (dest / "opencode.json").is_file():
+        return "opencode"
+    if (dest / ".gemini").is_dir():
+        return "agy"
+    if (dest / ".agents").is_dir() or (dest / "AGENTS.md").is_file():
+        return "codex"
+    if (dest / ".claude").is_dir() or (dest / ".claude.json").is_file():
+        return "claude"
+    return "opencode"  # default to opencode convention when ambiguous
+
+
 @server.tool()
 def harness2_apply_harness(
     harness_path: str,
     target_workspace: str,
     format: str = "auto",
+    dry_run: bool = True,
+    backup: bool = True,
 ) -> Dict[str, Any]:
-    """Export and apply a synthesized harness tree to a workspace for Codex, OpenCode, or Antigravity (agy).
+    """Export and apply a synthesized harness tree to a workspace with path collision safety.
 
-    Copies synthesized skills, scripts, and instructions into target client conventions:
-    - agy: writes to .gemini/skills/ and scripts/
-    - codex: writes to AGENTS.md, .agents/skills/, and scripts/
-    - opencode: writes to systemprompt.md, .opencode/skills/, and scripts/
+    Maps synthesized components into client workspace conventions:
+    - opencode: writes to .opencode/skills/<name>/..., scripts/..., and AGENTS.md
+    - agy: writes to .gemini/skills/<name>/..., scripts/..., and .gemini/rules/
+    - codex: writes to .agents/skills/<name>/..., scripts/..., and AGENTS.md
+    - claude: writes to .claude/skills/<name>/..., scripts/..., and CLAUDE.md
+
+    Preserves full subdirectories under skills/ to prevent collisions between different SKILL.md files.
+    Defaults to dry_run=True to allow inspection before writing.
 
     Args:
         harness_path: Absolute or relative path to the harness source directory.
         target_workspace: Root directory of the client project workspace.
-        format: Target format ('agy', 'codex', 'opencode', or 'auto').
+        format: Target format ('opencode', 'agy', 'codex', 'claude', or 'auto').
+        dry_run: When True (default), simulates the copying process without modifying any files.
+        backup: When True, creates a .bak backup copy before overwriting an existing file.
     """
     src = Path(harness_path).expanduser().resolve()
     dest = Path(target_workspace).expanduser().resolve()
@@ -164,52 +185,87 @@ def harness2_apply_harness(
     if not dest.is_dir():
         return {"status": "error", "message": f"Target workspace does not exist: {dest}"}
 
-    copied_files: List[str] = []
-
-    # Detect format if auto
-    chosen_format = format
-    if format == "auto":
-        if (dest / ".gemini").is_dir():
-            chosen_format = "agy"
-        elif (dest / ".agents").is_dir() or (dest / "AGENTS.md").is_file():
-            chosen_format = "codex"
-        else:
-            chosen_format = "agy"  # default to agy if ambiguous
+    chosen_format = _detect_workspace_format(dest) if format == "auto" else format.lower()
+    planned_operations: List[Dict[str, Any]] = []
 
     for root_dir, _, files in os.walk(src):
-        for file in files:
+        for file in sorted(files):
             file_path = Path(root_dir) / file
             rel_path = file_path.relative_to(src)
+            parts = rel_path.parts
 
-            # Determine destination based on format
-            if chosen_format == "agy":
-                if rel_path.name.endswith(".py") and "scripts" in rel_path.parts:
-                    target_file = dest / "scripts" / rel_path.name
-                elif "skills" in rel_path.parts:
-                    target_file = dest / ".gemini" / "skills" / rel_path.name
-                elif rel_path.name in ("systemprompt.md", "AGENTS.md", "guardrails.md"):
+            # Determine destination path preserving directory structure
+            if "skills" in parts:
+                # Find index of 'skills' and preserve all nested subdirectories (e.g. skills/<name>/SKILL.md)
+                skills_idx = parts.index("skills")
+                subpath = Path(*parts[skills_idx + 1 :]) if len(parts) > skills_idx + 1 else Path(file)
+                if chosen_format == "agy":
+                    target_file = dest / ".gemini" / "skills" / subpath
+                elif chosen_format == "codex":
+                    target_file = dest / ".agents" / "skills" / subpath
+                elif chosen_format == "claude":
+                    target_file = dest / ".claude" / "skills" / subpath
+                else:  # opencode
+                    target_file = dest / ".opencode" / "skills" / subpath
+
+            elif "scripts" in parts:
+                scripts_idx = parts.index("scripts")
+                subpath = Path(*parts[scripts_idx + 1 :]) if len(parts) > scripts_idx + 1 else Path(file)
+                target_file = dest / "scripts" / subpath
+
+            elif rel_path.name in ("systemprompt.md", "AGENTS.md", "guardrails.md", "LongTermMEMORY.md"):
+                if chosen_format == "agy":
                     target_file = dest / ".gemini" / "rules" / f"{rel_path.stem}.md"
-                else:
-                    target_file = dest / rel_path
-            elif chosen_format == "codex":
-                if "skills" in rel_path.parts:
-                    target_file = dest / ".agents" / "skills" / rel_path.name
-                elif rel_path.name in ("systemprompt.md", "AGENTS.md"):
+                elif chosen_format == "codex":
                     target_file = dest / "AGENTS.md"
-                else:
-                    target_file = dest / rel_path
-            else:  # opencode
+                elif chosen_format == "claude":
+                    target_file = dest / "CLAUDE.md"
+                else:  # opencode
+                    target_file = dest / "AGENTS.md"
+            else:
                 target_file = dest / rel_path
 
-            target_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(file_path, target_file)
-            copied_files.append(str(target_file.relative_to(dest)))
+            rel_dest = str(target_file.relative_to(dest))
+            is_overwrite = target_file.is_file()
+            planned_operations.append(
+                {
+                    "source": str(rel_path),
+                    "destination": rel_dest,
+                    "target_exists": is_overwrite,
+                }
+            )
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "format": chosen_format,
+            "message": "Previewing operations. Set dry_run=False to apply.",
+            "operations_count": len(planned_operations),
+            "operations": planned_operations,
+        }
+
+    # Execute file modifications safely
+    executed_files: List[str] = []
+    backups_created: List[str] = []
+
+    for op in planned_operations:
+        src_file = src / op["source"]
+        tgt_file = dest / op["destination"]
+
+        tgt_file.parent.mkdir(parents=True, exist_ok=True)
+        if tgt_file.is_file() and backup:
+            bak_path = tgt_file.with_name(tgt_file.name + ".bak")
+            shutil.copy2(tgt_file, bak_path)
+            backups_created.append(str(bak_path.relative_to(dest)))
+
+        shutil.copy2(src_file, tgt_file)
+        executed_files.append(op["destination"])
 
     return {
-        "status": "success",
+        "status": "applied",
         "format": chosen_format,
-        "copied_files_count": len(copied_files),
-        "files": copied_files,
+        "files_written": executed_files,
+        "backups_created": backups_created,
     }
 
 
