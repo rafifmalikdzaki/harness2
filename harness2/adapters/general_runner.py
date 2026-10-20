@@ -6,9 +6,18 @@ three things a real rollout needs:
 1. **Staging** the editable harness into the agent's workspace in the shape
    OpenCode actually loads (``AGENTS.md``, ``.opencode/skills``, ``.opencode/
    agent``, ``.opencode/plugin``, ``scripts/``).
-2. **Running** the solver in that workspace, fenced by ``OPENCODE_PERMISSION``
-   so the session can only touch the workspace it was given.
+2. **Running** the solver in that workspace, fenced so the session can only
+   touch the workspace it was given.
 3. **Reading back** the OpenCode event stream as the rollout's trajectory.
+
+Two runtimes are supported:
+
+* the **pinned source checkout** (``dependencies/opencode``) run through bun --
+  what the paper's numbers were produced with, and what the benchmarks use;
+* an **installed ``opencode`` binary** on PATH -- the pragmatic choice when
+  the checkout has not been fetched. It is a different build, so the fence
+  is expressed the way V2 expects (a config document) rather than the V1
+  environment variable the pinned version takes.
 
 The launcher contract is ``(RunRequest, Install) -> list[Path]``; the adapter
 builds one per rollout so the worktree is captured per call rather than
@@ -18,17 +27,21 @@ shared across concurrent rollouts.
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .. import config
-from ..substrate.opencode import OUTPUT_TOKEN_MAX
+from ..substrate.opencode import opencode_command
 from ..substrate.render import render_opencode_tree
 
-__all__ = ["GeneralRollout", "run_opencode_in_workspace", "stage_harness"]
+__all__ = [
+    "GeneralRollout",
+    "OpenCodeRuntime",
+    "resolve_runtime",
+    "run_opencode_in_workspace",
+    "stage_harness",
+]
 
 EVENT_PREFIX = '{"type":'
 
@@ -49,13 +62,67 @@ class GeneralRollout:
         return self.exit_code == 0
 
 
-def _permission(workspace: Path, extra: list[str] | None = None) -> str:
-    """Deny everything outside the workspace, and the workspace itself."""
+@dataclass(frozen=True)
+class OpenCodeRuntime:
+    """How to invoke OpenCode: from source, or from an installed binary."""
+
+    kind: str  # "source" | "binary"
+    argv: list[str]
+    cwd: Path
+    env: dict[str, str]
+
+
+def _v1_permission(workspace: Path, extra: list[str] | None) -> str:
+    """The V1 fence: deny everything outside the workspace."""
     allow = {"*": "deny", str(workspace): "allow", f"{workspace}/**": "allow"}
     for root in extra or []:
         allow[str(root)] = "allow"
         allow[f"{root}/**"] = "allow"
     return json.dumps({"external_directory": allow})
+
+
+def _v2_permission(workspace: Path, extra: list[str] | None) -> str:
+    """The V2 fence: the same boundary, in the shape V2 config expects."""
+    rules: list[dict[str, str]] = [
+        {"action": "external_directory", "resource": "*", "effect": "deny"},
+    ]
+    for root in extra or []:
+        rules.append({"action": "external_directory", "resource": f"{root}/*", "effect": "allow"})
+    return json.dumps({"permissions": rules})
+
+
+def resolve_runtime(
+    *,
+    workspace: Path,
+    prompt: str,
+    model: str,
+    title: str,
+    opencode_dir: Path | None = None,
+    bun: Path | None = None,
+    opencode_bin: str | None = None,
+    extra_allowed: list[str] | None = None,
+) -> OpenCodeRuntime:
+    """Pick the OpenCode runtime and build the argv for it.
+
+    The pinned source checkout wins when it is present: it is the build the
+    paper's numbers came from. Otherwise an installed binary is used, which
+    is what a developer already has.
+    """
+    command = opencode_command(
+        prompt=prompt,
+        workspace=workspace,
+        model=model,
+        title=title,
+        opencode_dir=opencode_dir,
+        bun=bun,
+        binary=opencode_bin,
+    )
+    return OpenCodeRuntime(
+        kind=command.kind,
+        argv=command.argv,
+        cwd=command.cwd,
+        env=command.env,
+    )
 
 
 def stage_harness(staged: Path, workspace: Path, ctx: dict) -> list[str]:
@@ -70,10 +137,10 @@ def stage_harness(staged: Path, workspace: Path, ctx: dict) -> list[str]:
     render_opencode_tree(staged, render_dir, ctx)
 
     authored: list[str] = []
-    for name in ("AGENTS.md",):
-        if (render_dir / name).is_file():
-            shutil.copy(render_dir / name, workspace / name)
-            authored.append(name)
+    name = "AGENTS.md"
+    if (render_dir / name).is_file():
+        shutil.copy(render_dir / name, workspace / name)
+        authored.append(name)
     for sub in (".opencode", "scripts"):
         src = render_dir / sub
         if not src.is_dir():
@@ -98,46 +165,25 @@ def run_opencode_in_workspace(
     timeout: int,
     opencode_dir: Path | None = None,
     bun: Path | None = None,
+    opencode_bin: str | None = None,
     extra_allowed: list[str] | None = None,
 ) -> GeneralRollout:
     """Run one OpenCode session in ``workspace`` and capture its event stream."""
-    oc_dir = Path(opencode_dir or config.OPENCODE_DIR)
-    bun_path = Path(bun or config.BUN)
-    if not (oc_dir / "packages" / "opencode" / "src" / "index.ts").is_file():
-        raise RuntimeError(
-            f"OpenCode checkout missing at {oc_dir} (no packages/opencode/src/index.ts): "
-            "run scripts/setup_benchmark.py to fetch the pinned checkout."
-        )
+    runtime = resolve_runtime(
+        workspace=workspace,
+        prompt=prompt,
+        model=model,
+        title=title,
+        opencode_dir=opencode_dir,
+        bun=bun,
+        opencode_bin=opencode_bin,
+        extra_allowed=extra_allowed,
+    )
 
     traj_dir = workspace / ".harness_traj"
     traj_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = traj_dir / "stdout.jsonl"
     stderr_path = traj_dir / "stderr.log"
-
-    argv = [
-        str(bun_path),
-        "run",
-        "--cwd",
-        str(oc_dir / "packages" / "opencode"),
-        "--conditions=browser",
-        "src/index.ts",
-        "run",
-        prompt,
-        "--dir",
-        str(workspace),
-        "--model",
-        model,
-        "--title",
-        title,
-        "--format",
-        "json",
-    ]
-
-    env = {
-        **os.environ,
-        "OPENCODE_PERMISSION": _permission(workspace, extra_allowed),
-        "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": str(int(OUTPUT_TOKEN_MAX)),
-    }
 
     code = 1
     with open(stdout_path, "w", encoding="utf-8") as out, open(
@@ -145,9 +191,9 @@ def run_opencode_in_workspace(
     ) as err:
         try:
             code = subprocess.run(
-                argv,
-                cwd=oc_dir,
-                env=env,
+                runtime.argv,
+                cwd=runtime.cwd,
+                env=runtime.env,
                 stdout=out,
                 stderr=err,
                 timeout=timeout,

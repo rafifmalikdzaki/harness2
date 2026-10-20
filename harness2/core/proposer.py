@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import config
+from ..substrate.opencode import opencode_command
 from .spec import ChannelSpec
 
 SYSTEM_ARG_MAX = 120_000
@@ -264,36 +265,21 @@ class Proposer:
             "Read MISSION.md first. Do what it asks. Reply with the requested output as "
             "your final message AND save it verbatim to output/answer.md."
         )
-        oc = _opencode_dir()
-
         env = self.env()
-        env["OPENCODE_PERMISSION"] = json.dumps(
-            {"external_directory": {"*": "deny", str(cwd): "allow", f"{cwd}/**": "allow"}}
-        )
         env["XDG_DATA_HOME"] = str(cwd / ".ocdata")
         env["XDG_STATE_HOME"] = str(cwd / ".ocstate")
 
-        cmd = [
-            str(config.BUN),
-            "run",
-            "--cwd",
-            str(oc / "packages" / "opencode"),
-            "--conditions=browser",
-            "src/index.ts",
-            "run",
-            prompt,
-            "--dir",
-            str(cwd),
-            "--model",
-            self.spec.model,
-            "--format",
-            "json",
-        ]
-        if self.spec.effort:
-            cmd += ["--variant", self.spec.effort]
+        command = opencode_command(
+            prompt=prompt,
+            workspace=cwd,
+            model=self.spec.model,
+            title="propose",
+            variant=self.spec.effort,
+        )
+        env.update(command.env)
         p = subprocess.run(
-            cmd,
-            cwd=cwd,
+            command.argv,
+            cwd=command.cwd,
             env=env,
             text=True,
             stdout=subprocess.PIPE,

@@ -27,9 +27,11 @@ one a benchmark uses moves that benchmark's baseline.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
@@ -168,6 +170,112 @@ def compose_prompt(staged: Path) -> str:
         )
     parts.append(_JINJA_PLACEHOLDER)
     return "\n\n---\n\n".join(parts)
+
+
+
+@dataclass(frozen=True)
+class OpenCodeCommand:
+    """One OpenCode invocation: the argv, where to run it, and its environment."""
+
+    argv: list[str]
+    cwd: Path
+    env: dict[str, str]
+    kind: str  # "source" | "binary"
+
+
+def _permission_v1(workspace: Path) -> str:
+    """The V1 fence: deny every path outside the workspace."""
+    return json.dumps(
+        {"external_directory": {"*": "deny", str(workspace): "allow", f"{workspace}/**": "allow"}}
+    )
+
+
+def _permission_v2(workspace: Path) -> str:
+    """The V2 fence: the same boundary, in the shape V2 configuration expects."""
+    return json.dumps(
+        {"permissions": [{"action": "external_directory", "resource": "*", "effect": "deny"}]}
+    )
+
+
+def opencode_command(
+    *,
+    prompt: str,
+    workspace: Path,
+    model: str,
+    title: str = "adapt",
+    variant: str | None = None,
+    agent: str = "",
+    session: str | None = None,
+    opencode_dir: Path | None = None,
+    bun: Path | None = None,
+    binary: str | None = None,
+) -> OpenCodeCommand:
+    """Build the command for whichever OpenCode runtime is available.
+
+    The pinned source checkout is preferred: it is the build the paper's
+    numbers came from, and it takes the permission fence as a V1 environment
+    variable. When the checkout has not been fetched, an installed
+    ``opencode`` binary is used instead; that build takes the fence as a V2
+    configuration document, and carries the variant inside the model id
+    rather than as a separate flag.
+    """
+    oc_dir = Path(opencode_dir or config.OPENCODE_DIR)
+    env = dict(os.environ)
+    env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] = str(int(OUTPUT_TOKEN_MAX))
+
+    if (oc_dir / "packages" / "opencode" / "src" / "index.ts").is_file():
+        argv = [
+            str(Path(bun or config.BUN)),
+            "run",
+            "--cwd",
+            str(oc_dir / "packages" / "opencode"),
+            "--conditions=browser",
+            "src/index.ts",
+            "run",
+            prompt,
+            "--dir",
+            str(workspace),
+            "--model",
+            model,
+            "--title",
+            title,
+            "--format",
+            "json",
+        ]
+        if agent:
+            argv += ["--agent", agent]
+        if variant:
+            argv += ["--variant", variant]
+        if session:
+            argv += ["--session", session]
+        env["OPENCODE_PERMISSION"] = _permission_v1(workspace)
+        return OpenCodeCommand(argv=argv, cwd=oc_dir, env=env, kind="source")
+
+    exe = binary or os.environ.get("HARNESS2_OPENCODE_BIN") or "opencode"
+    resolved = shutil.which(exe)
+    if not resolved:
+        raise RuntimeError(
+            f"no OpenCode runtime: neither the pinned checkout at {oc_dir} "
+            "(run scripts/setup_benchmark.py) nor an `opencode` binary on PATH"
+        )
+    argv = [
+        resolved,
+        "run",
+        "--format",
+        "json",
+        "--model",
+        f"{model}#{variant}" if variant else model,
+        "--title",
+        title,
+        str(workspace),
+        prompt,
+    ]
+    if agent:
+        argv += ["--agent", agent]
+    if session:
+        argv += ["--session", session]
+    env["OPENCODE_CONFIG_CONTENT"] = _permission_v2(workspace)
+    return OpenCodeCommand(argv=argv, cwd=Path(workspace), env=env, kind="binary")
 
 
 class OpencodeSubstrate:
