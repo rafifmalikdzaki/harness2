@@ -26,6 +26,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -34,6 +35,7 @@ from mcp.server.mcpserver import MCPServer
 from harness2 import config
 from harness2.adapters.general import GeneralTaskAdapter
 from harness2.adapters.worktree import WorktreeManager
+from harness2.core.evolution import SelfEvolutionEngine
 from harness2.core.memory_db import MemoryDB
 
 server = MCPServer(
@@ -42,7 +44,7 @@ server = MCPServer(
         "Harness² MCP Server: Automates recursive agent harnessing (Propose-Probe-Compose), "
         "SQLite-backed persistent session & long-term memory, and isolated worktree execution."
     ),
-    version="0.3.0",
+    version="0.4.0",
 )
 
 
@@ -150,7 +152,7 @@ def _detect_workspace_format(dest: Path) -> str:
         return "agy"
     if (dest / ".agents").is_dir() or (dest / "AGENTS.md").is_file():
         return "codex"
-    if (dest / ".claude").is_dir() or (dest / ".claude.json").is_file():
+    if (dest / ".claude").is_dir() or (dest / ".claude.json").is_file() or (dest / "CLAUDE.md").is_file():
         return "claude"
     return "opencode"
 
@@ -163,20 +165,18 @@ def harness2_apply_harness(
     dry_run: bool = True,
     backup: bool = True,
 ) -> Dict[str, Any]:
-    """Export and apply a synthesized harness tree to a workspace with path collision safety.
+    """Export and apply a synthesized harness tree to a workspace with collision and backup safety.
 
-    Maps synthesized components into client workspace conventions:
-    - opencode: writes to .opencode/skills/<name>/..., scripts/..., and AGENTS.md
-    - agy: writes to .gemini/skills/<name>/..., scripts/..., and .gemini/rules/
-    - codex: writes to .agents/skills/<name>/..., scripts/..., and AGENTS.md
-    - claude: writes to .claude/skills/<name>/..., scripts/..., and CLAUDE.md
+    Concatenates always-on instructions (systemprompt.md, guardrails.md, LongTermMEMORY.md)
+    into the client's single instruction file (AGENTS.md or CLAUDE.md) in a single pass,
+    creating a timestamped backup before touching existing project rules.
 
     Args:
         harness_path: Absolute or relative path to the harness source directory.
         target_workspace: Root directory of the client project workspace.
         format: Target format ('opencode', 'agy', 'codex', 'claude', or 'auto').
         dry_run: When True (default), simulates the copying process without modifying any files.
-        backup: When True, creates a .bak backup copy before overwriting an existing file.
+        backup: When True, creates a timestamped .bak copy of original files.
     """
     src = Path(harness_path).expanduser().resolve()
     dest = Path(target_workspace).expanduser().resolve()
@@ -189,11 +189,18 @@ def harness2_apply_harness(
     chosen_format = _detect_workspace_format(dest) if format == "auto" else format.lower()
     planned_operations: List[Dict[str, Any]] = []
 
+    # Accumulate always-on instructions to avoid overwrite collision
+    always_on_contents: Dict[str, str] = {}
+
     for root_dir, _, files in os.walk(src):
         for file in sorted(files):
             file_path = Path(root_dir) / file
             rel_path = file_path.relative_to(src)
             parts = rel_path.parts
+
+            if rel_path.name in ("systemprompt.md", "guardrails.md", "LongTermMEMORY.md"):
+                always_on_contents[rel_path.name] = file_path.read_text(encoding="utf-8", errors="replace")
+                continue
 
             if "skills" in parts:
                 skills_idx = parts.index("skills")
@@ -206,33 +213,42 @@ def harness2_apply_harness(
                     target_file = dest / ".claude" / "skills" / subpath
                 else:
                     target_file = dest / ".opencode" / "skills" / subpath
-
             elif "scripts" in parts:
                 scripts_idx = parts.index("scripts")
                 subpath = Path(*parts[scripts_idx + 1 :]) if len(parts) > scripts_idx + 1 else Path(file)
                 target_file = dest / "scripts" / subpath
-
-            elif rel_path.name in ("systemprompt.md", "AGENTS.md", "guardrails.md", "LongTermMEMORY.md"):
-                if chosen_format == "agy":
-                    target_file = dest / ".gemini" / "rules" / f"{rel_path.stem}.md"
-                elif chosen_format == "codex":
-                    target_file = dest / "AGENTS.md"
-                elif chosen_format == "claude":
-                    target_file = dest / "CLAUDE.md"
-                else:
-                    target_file = dest / "AGENTS.md"
             else:
                 target_file = dest / rel_path
 
-            rel_dest = str(target_file.relative_to(dest))
-            is_overwrite = target_file.is_file()
             planned_operations.append(
                 {
                     "source": str(rel_path),
-                    "destination": rel_dest,
-                    "target_exists": is_overwrite,
+                    "destination": str(target_file.relative_to(dest)),
+                    "target_exists": target_file.is_file(),
                 }
             )
+
+    # Plan single combined instruction file
+    combined_instruction_file = None
+    if always_on_contents:
+        if chosen_format == "agy":
+            # agy supports multiple files in .gemini/rules/
+            for name, content in always_on_contents.items():
+                tgt = dest / ".gemini" / "rules" / f"{Path(name).stem}.md"
+                planned_operations.append({
+                    "source": name,
+                    "destination": str(tgt.relative_to(dest)),
+                    "target_exists": tgt.is_file(),
+                })
+        else:
+            combined_instruction_file = (
+                dest / "CLAUDE.md" if chosen_format == "claude" else dest / "AGENTS.md"
+            )
+            planned_operations.append({
+                "source": "combined_instructions (" + ", ".join(always_on_contents.keys()) + ")",
+                "destination": str(combined_instruction_file.relative_to(dest)),
+                "target_exists": combined_instruction_file.is_file(),
+            })
 
     if dry_run:
         return {
@@ -243,21 +259,48 @@ def harness2_apply_harness(
             "operations": planned_operations,
         }
 
+    # Execute operations with backup
     executed_files: List[str] = []
     backups_created: List[str] = []
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
+    # 1. Write non-instruction files
     for op in planned_operations:
-        src_file = src / op["source"]
-        tgt_file = dest / op["destination"]
+        if op["source"].startswith("combined_instructions"):
+            continue
+        if op["source"] in always_on_contents and chosen_format != "agy":
+            continue
 
+        tgt_file = dest / op["destination"]
         tgt_file.parent.mkdir(parents=True, exist_ok=True)
         if tgt_file.is_file() and backup:
-            bak_path = tgt_file.with_name(tgt_file.name + ".bak")
+            bak_path = tgt_file.with_name(f"{tgt_file.name}.{timestamp}.bak")
             shutil.copy2(tgt_file, bak_path)
             backups_created.append(str(bak_path.relative_to(dest)))
 
+        src_file = src / op["source"]
         shutil.copy2(src_file, tgt_file)
         executed_files.append(op["destination"])
+
+    # 2. Append/merge combined instructions cleanly
+    if combined_instruction_file:
+        combined_instruction_file.parent.mkdir(parents=True, exist_ok=True)
+        existing_text = ""
+        if combined_instruction_file.is_file():
+            if backup:
+                bak_path = combined_instruction_file.with_name(f"{combined_instruction_file.name}.{timestamp}.bak")
+                shutil.copy2(combined_instruction_file, bak_path)
+                backups_created.append(str(bak_path.relative_to(dest)))
+            existing_text = combined_instruction_file.read_text(encoding="utf-8", errors="replace").strip() + "\n\n"
+
+        new_sections = []
+        for name in ("systemprompt.md", "guardrails.md", "LongTermMEMORY.md"):
+            if name in always_on_contents and always_on_contents[name].strip():
+                new_sections.append(f"<!-- [Harness2 {name}] -->\n" + always_on_contents[name].strip())
+
+        full_content = existing_text + "\n\n".join(new_sections) + "\n"
+        combined_instruction_file.write_text(full_content, encoding="utf-8")
+        executed_files.append(str(combined_instruction_file.relative_to(dest)))
 
     return {
         "status": "applied",
@@ -292,7 +335,6 @@ def harness2_solve(
     adapter = GeneralTaskAdapter(repo_root=ws, goal=goal, domain=domain, verify_cmd=verify_cmd)
     sess_id = adapter.session_id
 
-    # Execute initial rollout in worktree
     run_dir = adapter.execute(task_id=sess_id, harness_dir=None, run_id="probe_1")
 
     diff_text = adapter.deliverable_text(run_dir)
@@ -320,13 +362,16 @@ def harness2_finish(
     action: str = "accept",
     learned_facts: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
-    """Finalize a session, apply or discard changes, update SQLite memory, and delete worktrees.
+    """Finalize a session, apply or discard changes, run self-evolution, and delete worktrees.
+
+    Selects the best rollout (prioritizing test_passed=1), applies genuine code changes without
+    leaking internal scaffolding, triggers the self-evolution engine, and prunes the worktree.
 
     Args:
         session_id: The session ID returned by harness2_solve.
         workspace: Path to the target git repository.
         action: 'accept' (applies diff to repository and records memory) or 'discard' (cleans up without changes).
-        learned_facts: Optional list of facts to record into SQLite long-term memory (e.g. [{'category': 'arch', 'fact': '...'}, ...]).
+        learned_facts: Optional list of facts to record into SQLite long-term memory.
     """
     ws = Path(workspace).expanduser().resolve()
     db = MemoryDB(ws / ".harness2" / "memory.db")
@@ -337,15 +382,20 @@ def harness2_finish(
         return {"status": "error", "message": f"Session {session_id} not found."}
 
     applied = False
+    chosen_label = None
+
     if action == "accept":
-        # Find winning rollout or latest rollout
         rollouts = session.get("rollouts", [])
         if rollouts:
-            best_label = rollouts[-1]["label"]
-            wt_mgr.apply_to_repo(session_id, best_label)
+            # Select the best rollout: first prioritize test_passed == 1
+            passed_rollouts = [r for r in rollouts if r.get("test_passed") == 1]
+            chosen_rollout = passed_rollouts[0] if passed_rollouts else rollouts[-1]
+            chosen_label = chosen_rollout["label"]
+
+            wt_mgr.apply_to_repo(session_id, chosen_label)
             applied = True
 
-        # Store durable facts into SQLite
+        # Store explicit user/agent learned facts
         if learned_facts:
             for item in learned_facts:
                 if "category" in item and "fact" in item:
@@ -356,9 +406,14 @@ def harness2_finish(
                         evidence=item.get("evidence"),
                     )
 
-        db.close_session(session_id, status="accepted")
+        # Trigger Self-Evolution Engine: automatically synthesize lessons, facts, and skills
+        evolution_engine = SelfEvolutionEngine(ws, db=db)
+        evolution_result = evolution_engine.analyze_session(session_id)
+
+        db.close_session(session_id, status="accepted", best_rollout_id=chosen_label)
     else:
         db.close_session(session_id, status="discarded")
+        evolution_result = {"status": "skipped", "message": "Session discarded"}
 
     # Prune and delete all worktrees associated with this session
     cleaned_worktrees = wt_mgr.cleanup_session(session_id)
@@ -366,8 +421,10 @@ def harness2_finish(
     return {
         "status": "finished",
         "action": action,
+        "chosen_rollout": chosen_label,
         "applied_to_repository": applied,
         "deleted_worktrees": cleaned_worktrees,
+        "self_evolution": evolution_result,
     }
 
 

@@ -30,6 +30,16 @@ from ..substrate.opencode import OpencodeSubstrate
 from .worktree import WorktreeManager
 
 
+def _ensure_gitignore_has(repo: Path, entry: str) -> None:
+    gi = repo / ".gitignore"
+    if gi.is_file():
+        content = gi.read_text(encoding="utf-8", errors="replace")
+        if entry not in content:
+            gi.write_text(content.rstrip() + f"\n{entry}\n", encoding="utf-8")
+    else:
+        gi.write_text(f"{entry}\n", encoding="utf-8")
+
+
 class GeneralTaskAdapter:
     """BenchmarkAdapter implementation for arbitrary repositories, user goals, and test verification."""
 
@@ -47,8 +57,12 @@ class GeneralTaskAdapter:
         self.domain = domain.strip()
         self.verify_cmd = verify_cmd.strip() if verify_cmd else None
 
+        # Store internal state in .harness2 inside repo, but ensure it is gitignored
         self.harness_dir = self.repo_root / ".harness2"
         self.harness_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_gitignore_has(self.repo_root, ".harness2/")
+        _ensure_gitignore_has(self.repo_root, ".harness_staged/")
+
         self.db = MemoryDB(self.harness_dir / "memory.db")
         self.session_id = session_id or self.db.start_session(self.goal, self.domain)
 
@@ -142,6 +156,7 @@ class GeneralTaskAdapter:
                 test_passed = False
                 test_output = f"Execution error: {e}"
 
+        # Clean git diff, ignoring .harness_staged
         git_diff = self.wt_mgr.get_diff(self.session_id, label)
 
         # Record rollout in SQLite

@@ -75,20 +75,36 @@ class WorktreeManager:
         return dest
 
     def get_diff(self, session_id: str, label: str) -> str:
-        """Get the full git diff of changes authored inside this worktree against HEAD."""
+        """Get the clean git diff of user/code changes, filtering out internal scaffolding."""
         dest = self.worktree_dir(session_id, label)
         if not dest.is_dir():
             return ""
-        # Diff includes uncommitted working-tree changes + any commits made on the branch
+
+        # Remove internal scaffolding before computing diff
+        staged_internal = dest / ".harness_staged"
+        if staged_internal.exists():
+            shutil.rmtree(staged_internal, ignore_errors=True)
+
         diff_res = subprocess.run(
-            ["git", "diff", "HEAD"], cwd=dest, capture_output=True, text=True
+            ["git", "diff", "HEAD", "--", ":!.harness_staged", ":!.harness2"],
+            cwd=dest,
+            capture_output=True,
+            text=True,
         )
         untracked_res = subprocess.run(
-            ["git", "status", "--porcelain"], cwd=dest, capture_output=True, text=True
+            ["git", "status", "--porcelain", "--", ":!.harness_staged", ":!.harness2"],
+            cwd=dest,
+            capture_output=True,
+            text=True,
         )
         diff_text = diff_res.stdout
-        if untracked_res.stdout.strip():
-            diff_text += f"\n# Untracked files:\n{untracked_res.stdout}"
+        clean_untracked = "\n".join(
+            line
+            for line in untracked_res.stdout.splitlines()
+            if not line.endswith((".harness_staged/", ".harness2/"))
+        ).strip()
+        if clean_untracked:
+            diff_text += f"\n# Untracked files:\n{clean_untracked}\n"
         return diff_text
 
     def remove(self, session_id: str, label: str, force: bool = True) -> None:
@@ -107,10 +123,7 @@ class WorktreeManager:
                 if dest.exists():
                     shutil.rmtree(dest, ignore_errors=True)
 
-        # Prune worktree records
         subprocess.run(["git", "worktree", "prune"], cwd=self.repo_root, capture_output=True)
-
-        # Delete branch
         subprocess.run(
             ["git", "branch", "-D", branch], cwd=self.repo_root, capture_output=True
         )
@@ -131,16 +144,23 @@ class WorktreeManager:
         return cleaned
 
     def apply_to_repo(self, session_id: str, label: str) -> None:
-        """Cherry-pick or apply changes from the worktree into the primary repo working directory."""
+        """Apply genuine code changes from the worktree into the primary repo working directory."""
         dest = self.worktree_dir(session_id, label)
         if not dest.is_dir():
             raise WorktreeError(f"Worktree directory {dest} does not exist.")
 
-        # Stage any uncommitted files in the worktree
-        subprocess.run(["git", "add", "-A"], cwd=dest, capture_output=True)
-        # Generate patch
+        # Ensure internal scaffolding is completely removed from worktree before staging
+        staged_internal = dest / ".harness_staged"
+        if staged_internal.exists():
+            shutil.rmtree(staged_internal, ignore_errors=True)
+
+        # Stage untracked/modified files, explicitly ignoring internal directories
+        subprocess.run(["git", "add", "-A", "--", ":!.harness_staged", ":!.harness2"], cwd=dest, capture_output=True)
         patch_res = subprocess.run(
-            ["git", "diff", "--cached", "HEAD"], cwd=dest, capture_output=True, text=True
+            ["git", "diff", "--cached", "HEAD", "--", ":!.harness_staged", ":!.harness2"],
+            cwd=dest,
+            capture_output=True,
+            text=True,
         )
         patch = patch_res.stdout
         if patch.strip():
