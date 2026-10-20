@@ -91,7 +91,12 @@ def _is_base(label: str) -> bool:
 
 
 def selection_pool(
-    mode: str, k: int, rollouts: dict[str, RunView], base: Sequence[RunView]
+    mode: str,
+    k: int,
+    rollouts: dict[str, RunView],
+    base: Sequence[RunView],
+    *,
+    include_base: bool = False,
 ) -> dict[str, RunView]:
     """The one home for selection-pool construction: exactly the k finals of `mode`.
 
@@ -99,16 +104,22 @@ def selection_pool(
     one -- so the reference executions are not in the pool and there is no abstention by
     construction. This is the published convention and the only pool this release builds.
 
-    `base` is accepted and deliberately unused: it is what the pool excludes, and the call
-    site passes it so that exclusion is visible where the pool is built.
+    `include_base` puts the reference executions in the pool as well. A path with no
+    judge behind it needs that: if every composition regresses, a pool of finals alone
+    is empty and the run has no deliverable at all, whereas with the base in it the
+    selector can award the work to the base -- the honest outcome when a proposed
+    harness does not beat the one it started from.
     """
-    del base
     labels = (
         [f"agg{i}" for i in range(1, int(k) + 1)]
         if mode == "agg"
         else [f"c{t}" for t in range(1, int(k) + 1)]
     )
-    return {lbl: rollouts[lbl] for lbl in labels if lbl in rollouts}
+    pool = {lbl: rollouts[lbl] for lbl in labels if lbl in rollouts}
+    if include_base:
+        for r in base:
+            pool.setdefault(r.label, r)
+    return pool
 
 
 def _render_pool(

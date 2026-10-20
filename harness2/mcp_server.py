@@ -538,6 +538,9 @@ def harness2_recursion(
             runs_root=adapter.spec.runs_root,
             library_root=library_root,
             modes=modes,
+            # No judge behind this path: the reference executions belong in
+            # the pool so a regressed composition can lose to the base.
+            pool_policy="finals+base",
         )
     except Exception as exc:
         return {"status": "error", "message": f"{type(exc).__name__}: {exc}"}

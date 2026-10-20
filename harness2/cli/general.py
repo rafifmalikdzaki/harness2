@@ -105,6 +105,10 @@ def main(argv=None) -> int:
         runs_root=adapter.spec.runs_root,
         library_root=library_root,
         modes=modes,
+        # No judge sits behind this path, so the reference executions belong
+        # in the selection pool: a composition that regresses must be able to
+        # lose to the harness it started from.
+        pool_policy="finals+base",
     )
 
     report = adapter.harness_dir / f"general_{args.mode}_k{args.k}.json"

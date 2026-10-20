@@ -510,7 +510,9 @@ def _run_one_mode(
         library_dir=lib_dir,
     )
     res.modes[mode] = r.to_dict()
-    candidates = selection.selection_pool(mode, k, r.rollouts, base)
+    candidates = selection.selection_pool(
+        mode, k, r.rollouts, base, include_base=(pool_policy == "finals+base")
+    )
     if pool_policy == "finals" and k == 1:
         sel = selection.trivial_selection(
             task_id, k, mode, candidates, adapter=adapter, work_dir=work_dir
@@ -592,10 +594,11 @@ def run_task(
     unknown = sorted(set(modes) - set(MODES))
     if unknown:
         raise ValueError(f"unknown modes {unknown}; expected a subset of {MODES}")
-    if pool_policy != "finals":
+    if pool_policy not in ("finals", "finals+base"):
         raise ValueError(
-            f"unknown pool_policy {pool_policy!r}; this release builds exactly "
-            f"one selection pool, 'finals' (the k composed finals)"
+            f"unknown pool_policy {pool_policy!r}; this release builds 'finals' "
+            f"(the k composed finals) and 'finals+base' (the finals plus the "
+            f"reference executions, for paths with no judge behind them)"
         )
     mode_libs = _resolve_libraries(library, libraries, modes)
     selector = _selector_for(adapter, prop, selector_prop)
