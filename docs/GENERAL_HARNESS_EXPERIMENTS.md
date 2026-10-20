@@ -36,13 +36,13 @@ any repository, with evidence a reviewer can check.
 | Repo | `/home/dzakirm/AI-Tools/harness2`, branch `feat/general-harness` |
 | Python | 3.12, `.venv`, `uv pip install -e . --no-deps` |
 | OpenCode | 2.1.0 installed at `~/.opencode/bin/opencode` (no pinned source checkout) |
-| Model | `mistral/mistral-large-latest` for both solver and improver |
+| Model | `mistral/mistral-large-latest` for the early runs, `inception/mercury-3` for the final one |
 | Sandbox | `bwrap` (bubblewrap) at `/usr/bin/bwrap`, kernel 7.2.11 |
 | Task | A one-function repo: `calc.py` with `add()` subtracting, plus a request to write `test_calc.py` and a `--verify "python3 -m pytest -q test_calc.py"` gate |
 
 The OpenCode Console key was expired and the Anthropic account had no
-credit, so every live run used Mistral. It is a weaker improver than the
-paper's models, which turned out to matter (entry 8).
+credit, so the early runs used Mistral. It is a weaker improver than the
+paper's models, which turned out to matter (entry 9).
 
 ---
 
@@ -332,17 +332,44 @@ With a stronger model this is the effect the paper measures. With Mistral it
 is the opposite, and the loop showed it plainly: the base harness solved the
 task and **every** proposed harness made the agent produce nothing.
 
-This is a finding about the improver, not a bug in the loop — and it is
+This is a finding about the improver, not a bug in the loop -- and it is
 exactly why the base belongs in the selection pool (entry 5). With the base
 selectable, a regressed composition loses to the harness it started from,
 which is the honest outcome, and the library records it.
 
 The V2 fence also changed the agent's environment materially: the MCP
 servers it had been relying on were gone, and Code Mode with them. The
-`live6` lesson — *"candidates that moved the session to the worktree
+`live6` lesson -- *"candidates that moved the session to the worktree
 directory before editing succeeded; the others failed on permission
-errors"* — is a lesson about that, learned from real contrasts between
+errors"* -- is a lesson about that, learned from real contrasts between
 winning and losing rollouts.
+
+**Repeating the run with `inception/mercury-3`** (a stronger improver) made
+the difference visible. `live10`, launched from `/tmp` so that the working
+directory could not be the repository:
+
+* all six stages produced a harness, none fell back;
+* every candidate produced the **same correct fix** -- `return a - b` ->
+  `return a + b`, plus a `test_calc.py` that passes under the verifier
+  (`1 passed`);
+* the selector chose `agg2` from four candidates and said why: *"All four
+  candidates are byte-identical in the artifact content ... they differ only
+  in the label comment. The fix is correct and consistent with the source,
+  so no criterion distinguishes them."*;
+* the repository was untouched, and nothing leaked into it.
+
+The library entry is worth reading in full, because it shows the
+self-evolution engine being honest. For each placeholder component the
+improver added, it recorded:
+
+> *No rollout loads or references this component. Base harness (without it)
+> and all six candidates produce the identical trajectory ... No divergence
+> anywhere; the bundle change had no observable effect on execution or
+> output.* -- **verdict: confounded**
+
+The earlier version of that engine emitted the same template with the goal
+interpolated ("Avoid common failure modes seen in early probes"). This one
+names what it observed and admits when an edit did nothing.
 
 ---
 
@@ -364,8 +391,8 @@ winning and losing rollouts.
 ## 11. Reproducing it
 
 ```bash
-export HARNESS2_SOLVER_MODEL=mistral/mistral-large-latest
-export HARNESS2_IMPROVER_MODEL=mistral/mistral-large-latest
+export HARNESS2_SOLVER_MODEL=inception/mercury-3
+export HARNESS2_IMPROVER_MODEL=inception/mercury-3
 
 harness2-general --workspace /path/to/a/repo \
   --goal "calc.py has a bug: add() subtracts. Fix it so add() adds, and \
@@ -397,10 +424,13 @@ tool.
 
 ## 12. Open questions
 
-* The improver's model is the limiting factor. Every live run here used
-  Mistral, and it produced harness edits that were *worse* than the base.
-  The paper's claim -- that a single recursion step consistently improves on
-  the base harness -- needs a model that can improve on it.
+* The improver's model is the limiting factor. The Mistral runs produced
+  harness edits that were *worse* than the base; the `inception/mercury-3`
+  run produced edits that were indistinguishable from it, on a task simple
+  enough that no edit could show an effect. The paper's claim -- that a
+  single recursion step consistently improves on the base harness -- needs
+  a task set where an edit *can* show an effect, and a model that can find
+  one.
 * The sandbox needs `bwrap`, and `bwrap` needs user namespaces. Where those
   are unavailable the fence still applies, but a shell command keeps the
   operator's filesystem authority. The leak check is the backstop.
