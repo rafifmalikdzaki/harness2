@@ -338,6 +338,15 @@ class GeneralTaskAdapter:
             except Exception as e:
                 test_passed = False
                 test_output = f"Execution error: {e}"
+            # The verdict goes into the output the selector reads. A test
+            # runner's own summary line is its own business -- with `-q` it
+            # may print none -- but the exit status is not ambiguous, and a
+            # selector shown only a diff cannot tell a passing candidate
+            # from a failing one.
+            test_output = (
+                f"VERIFICATION: {'PASSED' if test_passed else 'FAILED'} "
+                f"(exit status {0 if test_passed else 1})\n\n{test_output}"
+            )
 
         self._verdicts[label] = bool(test_passed)
 

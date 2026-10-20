@@ -373,7 +373,87 @@ names what it observed and admits when an edit did nothing.
 
 ---
 
-## 10. What changed, in order
+## 10. Experiment 9 — the general path on a real research repository
+
+The toy repository of the earlier experiments is not a test. So the loop was
+run against `histodae` -- a histopathology research codebase, 11.7k lines
+across `src/histodae/`, 166 tests, its own virtualenv -- on a refactoring
+task found by reading the code rather than by inventing one.
+
+**The task.** The clustering implementation and its command-line options
+were duplicated and had drifted:
+
+* `run_clustering` was implemented twice, in `cli/cluster.py` and
+  `cli/biology.py`;
+* `--method` accepted `gmm` in `histodae biology` but not in
+  `histodae per-magnification`;
+* `--normalize` was validated against `NORMALIZERS` in one command and not
+  at all in two others, where an invalid value failed only later, deep
+  inside the clustering code.
+
+**What the run found -- about the harness.**
+
+1. **The evidence tree filled the disk.** The general path handed the
+   evidence builder the whole repository as the task's source material, and
+   the builder copies it once per stage: 310 GB on a 78 GB repository, and
+   the machine went to 99% full. The benchmarks never hit this because
+   their task material is a small data room. The source is now a bounded
+   room -- the repository's tracked text files, 1.5 MB -- and the copy
+   itself is capped.
+2. **A verification command was worth nothing.** The score looked for the
+   string `(no failures)`, which no test runner prints, so every rollout
+   scored zero. And the verifier's output never reached the selector at
+   all: a candidate that passed and one that failed looked identical in a
+   diff. The output now travels with the candidate, and the verdict is the
+   exit status rather than a guess made from the text.
+3. **A worktree is not a checkout.** The sandbox hid the project's
+   virtualenv, and the virtualenv's interpreter is usually a uv or pyenv
+   build outside the project entirely. The rollout could not run the
+   project's tests until the sandbox learned to expose the checkout, the
+   virtualenv, and the interpreter behind it.
+
+**What the run found -- about the loop.** It worked, on a real codebase:
+
+* eight rollouts in isolated worktrees, every one of them passing the
+  166-test suite;
+* four candidate harnesses proposed and composed into two finals;
+* the selector chose between them on evidence, and the reason it gave was
+  precise: *"Candidate A is the only one that both removes the duplicated
+  run_clustering AND adds parse-time `choices=list(CLUSTERING_METHODS)` to
+  cluster.py's `--methods` flag, closing the exact 'invalid value fails
+  deep inside as ValueError' gap the task names. Candidate C otherwise
+  consolidates correctly but leaves `--methods` unvalidated at parse
+  time."*
+* the winning refactor was correct: `gmm` is accepted by every command
+  that clusters, and an invalid normalizer is now rejected at parse time
+  with `invalid choice: 'bogus' (choose from 'none', 'standardize', 'l2',
+  'standardize_l2')`.
+
+The library entry that came out of it is worth reading, because it shows the
+self-evolution engine being honest about its own evidence:
+
+> *In both dom rollouts the first tool call is the skill tool ... Each still
+> produced an in-scope consolidation ... This is indistinguishable from
+> base1/base2, which completed the same consolidation in 2/2 with no skill at
+> all. No trajectory moment shows the skill preventing an error or altering
+> the deliverable.* -- **verdict: no observed effect**
+
+and, on the one candidate that diverged:
+
+> *That rollout's deliverable additionally deleted `scripts/researcher.py`,
+> an out-of-scope change base never made.* -- **verdict: confounded**
+
+**One caveat the run surfaced.** The verifier reported PASSED, and it did
+pass -- but it ran a slightly different suite than the user's own checkout.
+The worktree carries the repository's tracked files, and three of the
+tests need the *data checkout*, which is untracked and 78 GB of it. So the
+worktree skipped three tests the user's checkout runs. The suite's exit
+status was still zero, and the refactor was still sound -- but "the tests
+passed" meant "the tests that a worktree can run passed".
+
+---
+
+## 11. What changed, in order
 
 | commit | change |
 |---|---|
@@ -388,7 +468,7 @@ names what it observed and admits when an edit did nothing.
 
 ---
 
-## 11. Reproducing it
+## 12. Reproducing it
 
 ```bash
 export HARNESS2_SOLVER_MODEL=inception/mercury-3
@@ -422,7 +502,7 @@ tool.
 
 ---
 
-## 12. Open questions
+## 13. Open questions
 
 * The improver's model is the limiting factor. The Mistral runs produced
   harness edits that were *worse* than the base; the `inception/mercury-3`
@@ -441,3 +521,9 @@ tool.
   process with its working directory set to the workspace it means to write
   in. The sandbox does this with `--chdir`; the unsandboxed paths rely on
   `subprocess.run(cwd=...)`, which is right but easy to lose.
+* A worktree carries the repository's **tracked** files. Anything a test
+  needs from untracked data -- a dataset checkout, a cache -- is absent,
+  and the tests that need it skip. The verifier's exit status is still
+  zero, so a passing verification does not mean the user's own checkout
+  would pass the same way. A path with data to spare should either bind
+  the data into the worktree or say so in the report.
