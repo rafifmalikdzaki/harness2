@@ -1,0 +1,13 @@
+{
+  "mcp": {
+    "servers": {
+      "harness2": {
+        "type": "local",
+        "command": [
+          "/home/dzakirm/AI-Tools/harness2/.venv/bin/python",
+          "/home/dzakirm/AI-Tools/harness2/harness2/mcp_server.py"
+        ]
+      }
+    }
+  }
+}
