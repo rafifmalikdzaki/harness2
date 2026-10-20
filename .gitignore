@@ -50,4 +50,4 @@ splits/
 
 # Temporary scratch & test artifacts
 scratch/
-test_*.py
+/test_*.py
