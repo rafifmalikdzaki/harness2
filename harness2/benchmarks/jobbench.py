@@ -41,6 +41,7 @@ from ..install import codex_config_error
 from ..substrate.base import Install, RunRequest
 from ..substrate.codex import CodexSubstrate
 from ..substrate.opencode import OUTPUT_TOKEN_MAX, OpencodeSubstrate
+from ..substrate.render import compose_agent_body, render_opencode_tree
 from .tasks import discover, select
 
 _RUNNER_DIR = config.THIRD_PARTY / "jb_runner"
@@ -372,25 +373,6 @@ def jobbench_prompts(*, domain: str = "", profession: str = "") -> BenchPrompts:
     )
 
 
-_TOKEN = re.compile(r"\{\{\s*(\w+)\s*\}\}")
-_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
-
-
-def _interp(text: str, ctx: dict) -> str:
-    """Substitute {{ name }} tokens only; single braces in prose stay untouched."""
-    return _TOKEN.sub(lambda m: str(ctx.get(m.group(1), "")), text)
-
-
-def _strip_comments(text: str) -> str:
-    """Drop HTML comment blocks, so a comment-only component renders to nothing."""
-    return _COMMENT.sub("", text).strip()
-
-
-def _read_component(staged: Path, rel: str) -> str:
-    p = staged / rel
-    return p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
-
-
 def _render_ctx(domain: str) -> dict:
     """Template slots used by the JobBench harness."""
     return {
@@ -400,98 +382,6 @@ def _render_ctx(domain: str) -> dict:
         "date": datetime.now(timezone.utc).date().isoformat(),
         "working_directory": "the temp workspace (task_folder/ has inputs; write to output/)",
     }
-
-
-def _list_scripts(staged: Path) -> list[Path]:
-    d = staged / "scripts"
-    if not d.is_dir():
-        return []
-    return sorted(p for p in d.glob("*.py") if not p.name.startswith("_"))
-
-
-def _script_doc(p: Path) -> str:
-    """First line of the script's module docstring, if any."""
-    try:
-        txt = p.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return "helper script"
-    m = re.search(r'^\s*(?:"""|\'\'\')(.+)', txt)
-    return m.group(1).strip()[:120] if m else "helper script"
-
-
-def compose_agent_body(staged: Path, ctx: dict) -> str:
-    """c1 prose + c6 guardrails + c4 tool guidance + c3 memory + a c7 script note."""
-    parts: list[str] = []
-    sp = _strip_comments(_interp(_read_component(staged, "systemprompt.md"), ctx))
-    if sp:
-        parts.append(sp)
-    gr = _strip_comments(_interp(_read_component(staged, "guardrails.md"), ctx))
-    if gr:
-        parts.append("# Operating Guardrails\n\n" + gr)
-    tg = _strip_comments(
-        _interp(_read_component(staged, "tool_descriptions/tool_guidance.md"), ctx)
-    )
-    if tg:
-        parts.append(tg)
-    mem = _strip_comments(_interp(_read_component(staged, "LongTermMEMORY.md"), ctx))
-    if mem:
-        parts.append("# Long-Term Memory\n\n" + mem)
-    scripts = _list_scripts(staged)
-    if scripts:
-        listing = "\n".join(f"- `python scripts/{s.name}` — {_script_doc(s)}" for s in scripts)
-        parts.append(
-            "# Helper scripts (run via Bash)\n\nDeterministic helpers are available "
-            "in `./scripts`. Prefer them over hand-rolling the same logic:\n\n" + listing
-        )
-    return "\n\n".join(p for p in parts if p.strip()) + "\n"
-
-
-def _ensure_mode_subagent(text: str) -> str:
-    if re.search(r"(?m)^mode:\s*subagent", text):
-        return text
-    if text.lstrip().startswith("---"):
-        return re.sub(r"^---\n", "---\nmode: subagent\n", text, count=1)
-    return "---\nmode: subagent\ndescription: delegated subagent\n---\n\n" + text
-
-
-def render_opencode_tree(staged: Path, render_dir: Path, ctx: dict) -> None:
-    """Materialise the staged tree into OpenCode-loadable artifacts under render_dir:
-    AGENTS.md, .opencode/skills/<n>/, .opencode/agent/<sub>.md, scripts/, plugin/.
-    Skill directories are copied whole, so skills/<n>/scripts/*.py survive."""
-    staged, rd = Path(staged), Path(render_dir)
-    if rd.exists():
-        shutil.rmtree(rd)
-    (rd / ".opencode" / "agent").mkdir(parents=True)
-    (rd / ".opencode" / "skills").mkdir(parents=True)
-
-    body = compose_agent_body(staged, ctx)
-    if body.strip():
-        (rd / "AGENTS.md").write_text(body, encoding="utf-8")
-
-    skills_dir = staged / "skills"
-    if skills_dir.is_dir():
-        for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
-            shutil.copytree(skill_md.parent, rd / ".opencode" / "skills" / skill_md.parent.name)
-
-    sub_dir = staged / "sub_agents"
-    if sub_dir.is_dir():
-        for agent_md in sorted(sub_dir.glob("*/AGENT.md")):
-            (rd / ".opencode" / "agent" / f"{agent_md.parent.name}.md").write_text(
-                _ensure_mode_subagent(agent_md.read_text(encoding="utf-8", errors="replace")),
-                encoding="utf-8",
-            )
-
-    for s in _list_scripts(staged):
-        (rd / "scripts").mkdir(exist_ok=True)
-        shutil.copy(s, rd / "scripts" / s.name)
-
-    plugin_dir = staged / "plugin"
-    if plugin_dir.is_dir():
-        for p in sorted(plugin_dir.glob("*.ts")):
-            if p.name.startswith("_"):
-                continue
-            (rd / ".opencode" / "plugin").mkdir(parents=True, exist_ok=True)
-            shutil.copy(p, rd / ".opencode" / "plugin" / p.name)
 
 
 _INSTALL_MODE = {"oc": "workspace_agents_md", "cx": "codex_root"}

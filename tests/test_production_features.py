@@ -1,10 +1,9 @@
 import subprocess
-from pathlib import Path
-import pytest
-from harness2.core.memory_db import MemoryDB
-from harness2.core.evolution import SelfEvolutionEngine
+
 from harness2.adapters.worktree import WorktreeManager
-from harness2.mcp_server import harness2_apply_harness, harness2_finish
+from harness2.core.evolution import SelfEvolutionEngine
+from harness2.core.memory_db import MemoryDB
+from harness2.mcp_server import harness2_apply_harness
 
 
 def test_sqlite_memory_lifecycle(tmp_path):

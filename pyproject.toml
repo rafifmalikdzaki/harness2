@@ -34,6 +34,7 @@ harness2-bridge = "harness2.cli.bridge:main"
 harness2-mcp = "harness2.mcp_server:main"
 harness2-solve = "harness2.cli.solve:main"
 harness2-finish = "harness2.cli.finish:main"
+harness2-general = "harness2.cli.general:main"
 
 [tool.setuptools.packages.find]
 include = ["harness2*"]

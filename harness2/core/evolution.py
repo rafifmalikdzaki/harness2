@@ -26,7 +26,38 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .memory_db import MemoryDB
-from .tree import SurfaceSpec
+
+
+def _changed_files(diff: str) -> List[str]:
+    """The paths a unified diff touches, in order, without duplicates."""
+    out: List[str] = []
+    for line in diff.splitlines():
+        if not line.startswith("+++ b/"):
+            continue
+        rel = line[6:].strip()
+        if rel in ("/dev/null", ""):
+            continue
+        if rel not in out:
+            out.append(rel)
+    return out
+
+
+def _contrast_lesson(
+    goal: str,
+    winner: Dict[str, Any],
+    loser: Dict[str, Any],
+    winner_files: List[str],
+    loser_files: List[str],
+) -> str:
+    """A lesson that says what the winning rollout did differently."""
+    win = ", ".join(f"`{f}`" for f in winner_files[:5]) or "(no file changes recorded)"
+    lose = ", ".join(f"`{f}`" for f in loser_files[:5]) or "(no file changes recorded)"
+    return (
+        f"Rollout `{winner.get('label', '?')}` passed verification while "
+        f"`{loser.get('label', '?')}` did not. The winning rollout changed {win}; "
+        f"the failing one changed {lose}. For goals like this one, start from the "
+        f"files the winning rollout touched."
+    )
 
 
 class SelfEvolutionEngine:
@@ -58,11 +89,17 @@ class SelfEvolutionEngine:
 
         # 1. Self-Evolution from Test Verifications & Contrasts
         if successful and failed:
-            succ_diff = successful[0].get("git_diff", "")
-            fail_diff = failed[0].get("git_diff", "")
+            succ_files = _changed_files(successful[0].get("git_diff", ""))
+            fail_files = _changed_files(failed[0].get("git_diff", ""))
             lesson_cue = f"When solving: {goal[:80]}"
-            lesson_body = f"Adopt contrastive changes observed in winning rollout {successful[0]['label']} over {failed[0]['label']}."
-            
+            lesson_body = _contrast_lesson(
+                goal,
+                successful[0],
+                failed[0],
+                succ_files,
+                fail_files,
+            )
+
             self.db.record_lesson(
                 domain=domain,
                 cue=lesson_cue,
@@ -104,18 +141,40 @@ class SelfEvolutionEngine:
     def _extract_facts_from_context(self, goal: str, rollouts: List[Dict[str, Any]]) -> List[tuple]:
         facts = []
         combined_text = goal + "\n" + "\n".join(r.get("test_output", "") for r in rollouts)
-        
+        lower = combined_text.lower()
+
         # Pattern detection: frameworks & test runners
-        if "pytest" in combined_text.lower():
+        if "pytest" in lower:
             facts.append(("testing", "Project uses pytest for automated verification", 1.0, "goal/test output"))
-        if "jest" in combined_text.lower() or "npm test" in combined_text.lower():
+        if "jest" in lower or "npm test" in lower:
             facts.append(("testing", "Project uses Node/Jest for automated verification", 1.0, "goal/test output"))
-        if "fastapi" in combined_text.lower():
+        if "fastapi" in lower:
             facts.append(("architecture", "Backend framework includes FastAPI", 0.9, "task context"))
-        if "sqlite" in combined_text.lower():
+        if "sqlite" in lower:
             facts.append(("database", "Project incorporates SQLite database storage", 1.0, "context"))
-        if "docker" in combined_text.lower():
+        if "docker" in lower:
             facts.append(("devops", "Project supports Docker containerization", 1.0, "context"))
+
+        # What the successful rollouts actually touched: a fact about the
+        # repository's shape, not about the toolchain.
+        touched: set[str] = set()
+        for r in rollouts:
+            if r.get("test_passed") == 1:
+                touched.update(_changed_files(r.get("git_diff", "")))
+        by_dir: dict[str, int] = {}
+        for rel in touched:
+            top = rel.split("/", 1)[0]
+            if top and top not in (".", ".."):
+                by_dir[top] = by_dir.get(top, 0) + 1
+        for top, count in sorted(by_dir.items(), key=lambda kv: -kv[1])[:3]:
+            facts.append(
+                (
+                    "codebase",
+                    f"Successful work in this project touches {top}/ ({count} file(s) changed)",
+                    0.8,
+                    "winning rollout diffs",
+                )
+            )
 
         return facts
 
@@ -128,9 +187,16 @@ class SelfEvolutionEngine:
         if not clean_name:
             clean_name = f"skill-{domain}"
 
+        label = successful_rollouts[0].get("label", "probe")
+        files = _changed_files(successful_rollouts[0].get("git_diff", ""))
+        touched = ", ".join(f"`{f}`" for f in files[:8]) or "(no file changes recorded)"
+        procedure = (
+            "\n".join(f"{i}. Edit {rel}." for i, rel in enumerate(files[:8], 1))
+            or "1. Edit the files the goal names."
+        )
         skill_content = f"""---
 name: {clean_name}
-description: Procedural skill synthesized from successful resolution of: {goal}
+description: Procedural skill synthesized from a verified resolution of: {goal}
 ---
 
 # Skill: {clean_name.replace('-', ' ').title()}
@@ -140,10 +206,11 @@ When working on tasks related to:
 > {goal}
 
 ## Verified Procedure
-1. Review baseline dependencies and execute verification command.
-2. Apply lessons learned from rollout {successful_rollouts[0].get('label', 'probe')}:
-   - Avoid common failure modes seen in early probes.
-   - Maintain repository architectural conventions.
-3. Validate deliverables before finalizing the session.
+The rollout `{label}` passed its verification command. It changed:
+{touched}
+
+{procedure}
+
+3. Re-run the verification command and confirm it passes before finishing.
 """
         return {"name": clean_name, "content": skill_content}

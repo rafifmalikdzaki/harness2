@@ -138,6 +138,36 @@ Choose one benchmark per command. WorkBuddy also takes `--subset office`,
 [benchmark guides](docs/BENCHMARKS.md) cover each one's data, domains, and
 grading.
 
+## Run on your own repository (general task harness)
+
+No benchmark, no dataset, no judge. Point the engine at a git repository and
+a goal, and the same Propose-Probe-Compose loop runs:
+
+```bash
+export HARNESS2_SOLVER_MODEL=anthropic/claude-sonnet-4-5      # the solver
+export HARNESS2_IMPROVER_MODEL=anthropic/claude-sonnet-4-5    # the proposer/selector
+
+harness2-general --workspace ~/Research/histodae \
+  --goal "make --config-path accept a packaged config name" \
+  --k 2 --mode parallel
+```
+
+Each candidate harness is probed by running OpenCode in an **isolated git
+worktree**; the winning rollout's changes are left in that worktree for
+review and are not applied to your repository unless you ask for it. The
+harness the improver edited (its `AGENTS.md`, `.opencode/`, `scripts/`) is
+scaffolding and stays out of the deliverable, so the diff you review is the
+agent's work and nothing else.
+
+Add `--verify "pytest -q"` to grade a rollout by its exit status; with no
+verifier the selection is made purely on the contrast between candidates.
+Lessons land in the project's experience library under
+`<workspace>/.harness2/library/` and are offered to the next run through the
+harness's `LongTermMEMORY.md` component.
+
+The same thing is available to any MCP client as the `harness2_recursion`
+tool.
+
 ## Model Context Protocol (MCP) Integration
 
 Harness² includes an official **MCP Server** (`harness2-mcp`) that exposes recursive agent harnessing capabilities, domain experience library queries, benchmark diagnostics, and harness materialization to external coding agents (**Claude Code**, **OpenCode**, **Codex**, and **Antigravity**).
@@ -255,6 +285,20 @@ Once connected, your coding agent can invoke Harness² tools directly in respons
 > *"Check if the LAB and JobBench benchmarks are installed and ready for evaluation under OpenCode."*
 - Calls `harness2_benchmark_status(bench="lab", substrate="oc")`.
 - Validates pinned dependencies and environment health before starting benchmark sweeps.
+
+#### 5. Running the Real Loop on Your Own Repository
+> *"Use Harness² to work out how to add a `--config-path` flag to this project that accepts a packaged config name, then show me the diff."*
+- Calls `harness2_recursion(goal="...", workspace=".", k=1, mode="parallel")`.
+- Runs the real Propose–Probe–Compose loop: an improver model proposes harness
+  edits, each candidate is probed by running OpenCode in an isolated git
+  worktree, and a selector model picks the winner by reading the candidates.
+- The result is a diff and a worktree path; nothing is applied to your
+  repository until you call `harness2_finish(action="accept")`.
+
+#### 6. Solving a Task in an Isolated Worktree
+> *"Run this task in a sandbox and let me review the diff before it touches my repo."*
+- Calls `harness2_solve(goal="...", workspace=".", verify_cmd="pytest -q")`.
+- Cheaper than the full loop: one worktree, one command, one diff.
 
 ## Experiments
 

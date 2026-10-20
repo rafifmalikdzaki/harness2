@@ -454,6 +454,107 @@ def harness2_query_memory(
     }
 
 
+
+@server.tool()
+def harness2_recursion(
+    goal: str,
+    workspace: str,
+    k: int = 1,
+    mode: str = "parallel",
+    domain: str = "general",
+    verify_cmd: Optional[str] = None,
+    timeout: int = 1800,
+) -> Dict[str, Any]:
+    """Run the real Propose-Probe-Compose loop on a repository and goal.
+
+    This is Harness² proper, not a scripted stand-in: an improver model
+    proposes harness edits (instructions, guardrails, skills, scripts), each
+    candidate is probed by running OpenCode in an isolated git worktree, the
+    best contrasts are composed into a refined harness, and a selector model
+    picks the winner by reading the candidates -- no ground-truth verifier
+    required. The verified result is left in an isolated worktree for review;
+    nothing is applied to the repository unless you call harness2_finish with
+    action='accept'.
+
+    Costs real model calls: k=1 in one mode is roughly 4 rollouts plus the
+    proposal and selection sessions. Start with k=1.
+
+    Args:
+        goal: What the agent should accomplish in the repository.
+        workspace: Path to the git repository to work in.
+        k: Task-level recursion budget (1 = one propose/probe/compose round).
+        mode: 'parallel' (wide) or 'sequential' (deep).
+        domain: Domain label; entries are filed under it in the experience library.
+        verify_cmd: Optional verification command; a rollout that passes it is
+            preferred when selecting.
+        timeout: Per-rollout timeout in seconds.
+    """
+    ws = Path(workspace).expanduser().resolve()
+    if not (ws / ".git").exists():
+        return {"status": "error", "message": f"{ws} is not a git repository."}
+    if k < 1:
+        return {"status": "error", "message": "--k must be positive."}
+    if mode not in ("parallel", "sequential"):
+        return {"status": "error", "message": "mode must be 'parallel' or 'sequential'."}
+
+    from harness2 import config
+    from harness2.adapters.general import GeneralTaskAdapter
+    from harness2.core.proposer import Proposer
+    from harness2.core.schedule import mode_token, run_domain
+    from harness2.core.spec import resolve_channel_model
+
+    solver_model = config.SOLVER_MODEL_OC.strip()
+    improver_model = config.IMPROVER_MODEL.strip()
+    if not solver_model or not improver_model:
+        return {
+            "status": "error",
+            "message": (
+                "no models configured: set HARNESS2_SOLVER_MODEL and "
+                "HARNESS2_IMPROVER_MODEL (the opencode channel needs a "
+                "provider-prefixed id, e.g. anthropic/claude-sonnet-4-5)."
+            ),
+        }
+
+    modes = (mode_token(mode),)
+    adapter = GeneralTaskAdapter(
+        repo_root=ws,
+        goal=goal,
+        domain=domain,
+        verify_cmd=verify_cmd,
+        model=solver_model,
+        timeout=timeout,
+    )
+    proposer = Proposer(resolve_channel_model("opencode", improver_model))
+    library_root = adapter.harness_dir / "library" / f"k{k}"
+
+    try:
+        result = run_domain(
+            domain,
+            adapter.tasks(),
+            k,
+            adapter=adapter,
+            prop=proposer,
+            runs_root=adapter.spec.runs_root,
+            library_root=library_root,
+            modes=modes,
+        )
+    except Exception as exc:
+        return {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
+
+    report = adapter.harness_dir / f"general_{mode}_k{k}.json"
+    report.write_text(json.dumps(result, indent=2, default=str) + "\n", encoding="utf-8")
+
+    return {
+        "status": "done" if not result.get("failed") else "partial",
+        "done": result.get("done", 0),
+        "failed": result.get("failed", 0),
+        "tasks": result.get("tasks", []),
+        "runs_root": str(adapter.spec.runs_root),
+        "library_root": str(library_root),
+        "report": str(report),
+    }
+
+
 @server.tool()
 def harness2_benchmark_status(
     bench: str = "jb",

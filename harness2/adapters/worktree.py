@@ -24,7 +24,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional, Sequence
 
 
 class WorktreeError(RuntimeError):
@@ -74,8 +74,16 @@ class WorktreeManager:
         _run_git(["worktree", "add", "-b", branch, str(dest), "HEAD"], cwd=self.repo_root)
         return dest
 
-    def get_diff(self, session_id: str, label: str) -> str:
-        """Get the clean git diff of user/code changes, filtering out internal scaffolding."""
+    def get_diff(
+        self, session_id: str, label: str, exclude: Optional[Sequence[str]] = None
+    ) -> str:
+        """Get the clean git diff of user/code changes, filtering out internal scaffolding.
+
+        `exclude` names paths the harness itself wrote into the worktree (the
+        rendered AGENTS.md, .opencode/, scripts/). Those are the harness the
+        improver edited, not the agent's work, so they must not read as
+        changes the solver made.
+        """
         dest = self.worktree_dir(session_id, label)
         if not dest.is_dir():
             return ""
@@ -85,23 +93,39 @@ class WorktreeManager:
         if staged_internal.exists():
             shutil.rmtree(staged_internal, ignore_errors=True)
 
+        pathspec = [
+            ":!.harness_staged",
+            ":!.harness2",
+            ":!.harness_authored",
+            ":!.harness_traj",
+        ]
+        for rel in exclude or []:
+            rel = rel.strip()
+            if rel:
+                pathspec.append(f":(exclude){rel}")
+
         diff_res = subprocess.run(
-            ["git", "diff", "HEAD", "--", ":!.harness_staged", ":!.harness2"],
+            ["git", "diff", "HEAD", "--", *pathspec],
             cwd=dest,
             capture_output=True,
             text=True,
         )
         untracked_res = subprocess.run(
-            ["git", "status", "--porcelain", "--", ":!.harness_staged", ":!.harness2"],
+            ["git", "status", "--porcelain", "--", *pathspec],
             cwd=dest,
             capture_output=True,
             text=True,
         )
         diff_text = diff_res.stdout
+        excluded = {e.strip() for e in (exclude or []) if e.strip()}
+        # Only genuinely untracked paths belong in this section; modified files
+        # are already in the diff above.
         clean_untracked = "\n".join(
             line
             for line in untracked_res.stdout.splitlines()
-            if not line.endswith((".harness_staged/", ".harness2/"))
+            if line.startswith("??")
+            and not line.endswith((".harness_staged/", ".harness2/"))
+            and line[3:].strip() not in excluded
         ).strip()
         if clean_untracked:
             diff_text += f"\n# Untracked files:\n{clean_untracked}\n"
