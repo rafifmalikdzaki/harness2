@@ -266,9 +266,6 @@ class Proposer:
             "your final message AND save it verbatim to output/answer.md."
         )
         env = self.env()
-        env["XDG_DATA_HOME"] = str(cwd / ".ocdata")
-        env["XDG_STATE_HOME"] = str(cwd / ".ocstate")
-
         command = opencode_command(
             prompt=prompt,
             workspace=cwd,
@@ -277,6 +274,12 @@ class Proposer:
             variant=self.spec.effort,
         )
         env.update(command.env)
+        if command.kind == "source":
+            # The source build is self-contained, so the session's state can be
+            # isolated. The installed build finds its credentials in the
+            # real data dir, so redirecting XDG there would lock it out.
+            env["XDG_DATA_HOME"] = str(cwd / ".ocdata")
+            env["XDG_STATE_HOME"] = str(cwd / ".ocstate")
         p = subprocess.run(
             command.argv,
             cwd=command.cwd,

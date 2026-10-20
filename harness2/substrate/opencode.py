@@ -261,10 +261,14 @@ def opencode_command(
     argv = [
         resolved,
         "run",
+        # The installed build talks to a managed service on a fixed port; a
+        # private server per invocation avoids colliding with a running
+        # session (and with the other rollouts running alongside this one).
+        "--standalone",
         "--format",
         "json",
         "--model",
-        f"{model}#{variant}" if variant else model,
+        model,
         "--title",
         title,
         str(workspace),
@@ -274,6 +278,11 @@ def opencode_command(
         argv += ["--agent", agent]
     if session:
         argv += ["--session", session]
+
+    # The fence. The pinned build took the proposer's reasoning effort as a
+    # model variant; V2 rejects both the variant and the effort for models
+    # that do not offer them, so neither is forced here. A caller that wants
+    # a named variant asks for it in the model id (provider/model#variant).
     env["OPENCODE_CONFIG_CONTENT"] = _permission_v2(workspace)
     return OpenCodeCommand(argv=argv, cwd=Path(workspace), env=env, kind="binary")
 

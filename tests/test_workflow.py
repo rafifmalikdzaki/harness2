@@ -137,8 +137,15 @@ class WorkflowTests(unittest.TestCase):
             return Mock(stdout='{"type":"text","part":{"text":"done"}}', stderr="", returncode=0)
 
         proposer = Proposer(self.proposer.spec)
+        # Force the source runtime: this test is about session isolation, and
+        # only the self-contained build isolates its data dir. Pointing the
+        # checkout at a temp tree keeps the test independent of whatever
+        # OpenCode happens to be installed on the machine.
+        checkout = self.root / "oc-checkout"
+        (checkout / "packages" / "opencode" / "src").mkdir(parents=True, exist_ok=True)
+        (checkout / "packages" / "opencode" / "src" / "index.ts").write_text("// stub\n")
         with (
-            patch("harness2.core.proposer._opencode_dir", return_value=self.root),
+            patch("harness2.config.OPENCODE_DIR", checkout),
             patch("harness2.core.proposer.subprocess.run", side_effect=run_opencode),
         ):
             for index in range(2):
