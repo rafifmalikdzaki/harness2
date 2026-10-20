@@ -522,6 +522,7 @@ def harness2_recursion(
         domain=domain,
         verify_cmd=verify_cmd,
         model=solver_model,
+        selector_model=improver_model,
         timeout=timeout,
     )
     proposer = Proposer(resolve_channel_model("opencode", improver_model))

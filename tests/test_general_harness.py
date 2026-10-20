@@ -217,3 +217,26 @@ def test_evolution_lessons_name_the_files_that_changed(tmp_path):
     # the skill names the file it verified against
     skill = out["synthesized_skills"][0]["content"]
     assert "greet.py" in skill
+
+
+def test_adapter_channels_name_a_real_model(tmp_path):
+    """The scheduler builds the selector's proposer from this channel.
+
+    A placeholder there (the old "general/solver") makes the selection
+    session fail with "Model unavailable", so the channel must name a model
+    the provider can actually serve.
+    """
+    adapter = make_adapter(tmp_path, model="mistral/mistral-large-latest")
+    for name in ("proposer", "selector"):
+        channel = adapter.spec.channels[name]
+        assert channel.model == "mistral/mistral-large-latest"
+        assert "/" in channel.model, "the opencode channel needs provider/model"
+
+
+def test_selector_model_may_differ_from_the_solver(tmp_path):
+    adapter = make_adapter(
+        tmp_path,
+        model="mistral/mistral-large-latest",
+        selector_model="mistral/mistral-small-latest",
+    )
+    assert adapter.spec.channels["selector"].model == "mistral/mistral-small-latest"

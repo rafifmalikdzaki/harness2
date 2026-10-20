@@ -88,6 +88,7 @@ def main(argv=None) -> int:
         verify_cmd=args.verify,
         runs_root=args.runs_root,
         model=solver_model,
+        selector_model=improver_model,
         timeout=args.timeout,
     )
 

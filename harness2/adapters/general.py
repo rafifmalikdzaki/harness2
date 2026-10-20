@@ -54,6 +54,7 @@ class GeneralTaskAdapter:
         verify_cmd: Optional[str] = None,
         runs_root: Optional[Path | str] = None,
         model: str = "",
+        selector_model: str = "",
         timeout: int = 1800,
     ):
         self.repo_root = Path(repo_root).expanduser().resolve()
@@ -61,6 +62,11 @@ class GeneralTaskAdapter:
         self.domain = domain.strip()
         self.verify_cmd = verify_cmd.strip() if verify_cmd else None
         self.model = model.strip()
+        # The proposer and the selector may run on a different model from the
+        # solver. The channel spec has to name a real model: the scheduler
+        # builds the selector's proposer from it, and a placeholder there
+        # fails the selection session with "Model unavailable".
+        self.selector_model = (selector_model or model).strip()
         self.timeout = int(timeout)
 
         # Internal state lives in .harness2 inside the repo; keep it ignored.
@@ -84,7 +90,7 @@ class GeneralTaskAdapter:
             if runs_root
             else self.harness_dir / "runs"
         )
-        channel = ChannelSpec("opencode", "general/solver")
+        channel = ChannelSpec("opencode", self.selector_model)
         self.spec = BenchSpec(
             name="general",
             runs_root=actual_runs_root,
