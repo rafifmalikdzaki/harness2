@@ -140,10 +140,17 @@ grading.
 
 ## Model Context Protocol (MCP) Integration
 
-Harness² includes an official **MCP Server** that exposes recursive agent harnessing capabilities, domain experience library queries, and harness materialization to external coding agents (**Claude Code**, **OpenCode**, **Codex**, and **Antigravity**).
+Harness² includes an official **MCP Server** (`harness2-mcp`) that exposes recursive agent harnessing capabilities, domain experience library queries, benchmark diagnostics, and harness materialization to external coding agents (**Claude Code**, **OpenCode**, **Codex**, and **Antigravity**).
 
-### Start the Server Directly
+### Installation & Prerequisites
 
+1. Install the MCP dependencies into your environment:
+```bash
+uv pip install -e .
+uv pip install "mcp>=1.0.0"
+```
+
+2. Start or test the server directly over stdio:
 ```bash
 # Via CLI entrypoint
 harness2-mcp
@@ -152,26 +159,78 @@ harness2-mcp
 python -m harness2.mcp_server
 ```
 
-### Client Configuration
+---
 
-Add the server to your agent's configuration:
+### Client Setup Guides
 
+#### A. OpenCode
+Add globally via the OpenCode CLI:
+```bash
+opencode mcp add --global harness2 -- /absolute/path/to/harness2/.venv/bin/python /absolute/path/to/harness2/harness2/mcp_server.py
+```
+Or add to `opencode.json` in your project root:
+```json
+{
+  "mcp": {
+    "servers": {
+      "harness2": {
+        "type": "local",
+        "command": [
+          "/absolute/path/to/harness2/.venv/bin/python",
+          "/absolute/path/to/harness2/harness2/mcp_server.py"
+        ]
+      }
+    }
+  }
+}
+```
+Verify connection with: `opencode mcp list`.
+
+#### B. Claude Code
+Register using Claude's CLI:
+```bash
+claude mcp add harness2 -- /absolute/path/to/harness2/.venv/bin/python /absolute/path/to/harness2/harness2/mcp_server.py
+```
+Or add directly to `~/.claude.json`:
 ```json
 {
   "mcpServers": {
     "harness2": {
-      "command": "/path/to/harness2/.venv/bin/python",
-      "args": ["/path/to/harness2/harness2/mcp_server.py"]
+      "command": "/absolute/path/to/harness2/.venv/bin/python",
+      "args": ["/absolute/path/to/harness2/harness2/mcp_server.py"]
     }
   }
 }
 ```
 
-Config paths:
-- **Claude Code**: `~/.claude.json` or run `claude mcp add harness2 -- <path-to-venv-python> <path-to-mcp_server.py>`
-- **OpenCode**: `~/.config/opencode/opencode.json` (under `mcp.servers`)
-- **Codex CLI**: `~/.codex/config.json`
-- **Antigravity (`agy`)**: `~/.gemini/config/mcp_config.json`
+#### C. Codex CLI
+Add to `~/.codex/config.json`:
+```json
+{
+  "mcpServers": {
+    "harness2": {
+      "command": "/absolute/path/to/harness2/.venv/bin/python",
+      "args": ["/absolute/path/to/harness2/harness2/mcp_server.py"]
+    }
+  }
+}
+```
+
+#### D. Antigravity (`agy`)
+Add to `~/.gemini/config/mcp_config.json`:
+```json
+{
+  "mcpServers": {
+    "harness2": {
+      "command": "/absolute/path/to/harness2/.venv/bin/python",
+      "args": ["/absolute/path/to/harness2/harness2/mcp_server.py"],
+      "disabled": false
+    }
+  }
+}
+```
+
+---
 
 ### Natural Language Examples (Prompts for Your Agent)
 
