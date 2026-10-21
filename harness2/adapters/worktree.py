@@ -178,10 +178,21 @@ class WorktreeManager:
         if staged_internal.exists():
             shutil.rmtree(staged_internal, ignore_errors=True)
 
-        # Stage untracked/modified files, explicitly ignoring internal directories
-        subprocess.run(["git", "add", "-A", "--", ":!.harness_staged", ":!.harness2"], cwd=dest, capture_output=True)
+        # Stage untracked/modified files, explicitly ignoring internal directories & caches
+        exclude_args = [
+            ":(exclude).harness_staged",
+            ":(exclude).harness2",
+            ":(exclude)__pycache__",
+            ":(exclude)*.pyc",
+            ":(exclude).pytest_cache",
+        ]
+        subprocess.run(
+            ["git", "add", "-A", "--", *exclude_args],
+            cwd=dest,
+            capture_output=True,
+        )
         patch_res = subprocess.run(
-            ["git", "diff", "--cached", "HEAD", "--", ":!.harness_staged", ":!.harness2"],
+            ["git", "diff", "--cached", "HEAD", "--binary", "--", *exclude_args],
             cwd=dest,
             capture_output=True,
             text=True,

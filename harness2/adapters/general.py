@@ -29,6 +29,8 @@ from ..substrate.base import Install, RunRequest
 from ..substrate.opencode import OpencodeSubstrate
 from .general_runner import run_opencode_in_workspace, stage_harness
 from .sandbox import sandbox_argv, sandbox_available, sandbox_env
+from . import agent
+from .. import llm
 from .worktree import WorktreeManager
 
 __all__ = ["GeneralTaskAdapter"]
@@ -41,7 +43,8 @@ _SOURCE_ROOM_BYTES = 32_000_000
 _SOURCE_ROOM_FILE_BYTES = 500_000
 
 
-def _ensure_gitignore_has(repo: Path, entry: str) -> None:
+def _ensure_excluded(repo: Path, entry: str) -> None:
+    """Ignore Harness² state in both .gitignore and .git/info/exclude."""
     gi = repo / ".gitignore"
     if gi.is_file():
         content = gi.read_text(encoding="utf-8", errors="replace")
@@ -49,6 +52,15 @@ def _ensure_gitignore_has(repo: Path, entry: str) -> None:
             gi.write_text(content.rstrip() + f"\n{entry}\n", encoding="utf-8")
     else:
         gi.write_text(f"{entry}\n", encoding="utf-8")
+
+    git_dir = repo / ".git"
+    if git_dir.is_file():  # worktree/submodule: "gitdir: <path>"
+        git_dir = Path(git_dir.read_text().split(":", 1)[1].strip())
+    ex = git_dir / "info" / "exclude"
+    ex.parent.mkdir(parents=True, exist_ok=True)
+    content = ex.read_text(encoding="utf-8", errors="replace") if ex.is_file() else ""
+    if entry not in content.splitlines():
+        ex.write_text(content.rstrip() + ("\n" if content else "") + f"{entry}\n", encoding="utf-8")
 
 
 class GeneralTaskAdapter:
@@ -93,8 +105,8 @@ class GeneralTaskAdapter:
         # Internal state lives in .harness2 inside the repo; keep it ignored.
         self.harness_dir = self.repo_root / ".harness2"
         self.harness_dir.mkdir(parents=True, exist_ok=True)
-        _ensure_gitignore_has(self.repo_root, ".harness2/")
-        _ensure_gitignore_has(self.repo_root, ".harness_staged/")
+        _ensure_excluded(self.repo_root, ".harness2/")
+        _ensure_excluded(self.repo_root, ".harness_staged/")
 
         self.db = MemoryDB(self.harness_dir / "memory.db")
         self.session_id = session_id or self.db.start_session(self.goal, self.domain)
@@ -288,6 +300,17 @@ class GeneralTaskAdapter:
 
         return launch
 
+    def _run_verify(self, wt_path: Path, timeout: int) -> tuple:
+        if not self.verify_cmd:
+            return None, ""
+        try:
+            proc = subprocess.run(
+                self.verify_cmd, cwd=wt_path, shell=True, capture_output=True, text=True, timeout=timeout
+            )
+            return proc.returncode == 0, (proc.stdout + "\n" + proc.stderr).strip()
+        except Exception as e:  # timeout, missing binary, ...
+            return False, f"Execution error: {e}"
+
     def execute(
         self,
         task_id: str,
@@ -295,80 +318,47 @@ class GeneralTaskAdapter:
         run_id: str,
         *,
         timeout: int | None = None,
+        strategy: str = "minimal",
+        repair_rounds: int = 1,
+        extra_files: Optional[List[str]] = None,
     ) -> Path:
-        """Execute one rollout: an isolated worktree, the solver, and the evidence."""
+        """One candidate: isolated worktree -> LLM edits -> verify -> repair -> independent critique."""
         label = run_id.replace("/", "__")
         wt_path = self.wt_mgr.create(self.session_id, label)
-        wall = int(timeout or self.timeout)
-        before = self._tree_state()
+        timeout = timeout or 600
+        strength = agent.verification_strength(self.verify_cmd)
+        log: Dict[str, object] = {"strategy": strategy, "verification_strength": strength}
 
-        active = harness_dir or self.base_harness()
-        install = self.substrate.materialise(active, self.spec, {})
-        try:
-            substrate = OpencodeSubstrate(launcher=self._launcher(wt_path, wall))
-            substrate.execute(task_id, install, [run_id], wall)
-        finally:
-            shutil.rmtree(install.staging_dir, ignore_errors=True)
+        provider = llm.resolve_provider()
+        claims: List[str] = []
+        if provider is None:
+            log["llm"] = "not configured: verify-only run (no code was generated)"
+            test_passed, test_output = self._run_verify(wt_path, timeout)
+        else:
+            log["llm"] = provider.public()
+            memory_md = self.db.render_longterm_memory_markdown()
+            feedback = ""
+            test_passed, test_output = None, ""
+            for attempt in range(1 + max(0, repair_rounds)):
+                try:
+                    res = agent.solve(wt_path, self.goal, strategy, memory_md, feedback, extra_files)
+                except (llm.LLMError, ValueError) as e:
+                    log.setdefault("errors", []).append(f"attempt {attempt}: {e}")
+                    break
+                claims = res["claims"] or claims
+                log.setdefault("attempts", []).append({"plan": res["plan"], "touched": res["touched"]})
+                test_passed, test_output = self._run_verify(wt_path, timeout)
+                if test_passed is not False:
+                    break
+                feedback = f"Verification command `{self.verify_cmd}` failed:\n{test_output[-4000:]}"
 
-        # The harness's own files are scaffolding, not the agent's work.
-        authored = self._authored_paths(wt_path)
-        git_diff = self.wt_mgr.get_diff(self.session_id, label, exclude=authored)
-
-        # The fence is a boundary on paths, not a guarantee: OpenCode's own
-        # session and worktree tools can relocate a session or register a
-        # worktree of another repository, and the shell runs with the
-        # operator's authority. So the rollout is also checked afterwards,
-        # and anything it left outside its worktree is reported rather than
-        # discovered later.
-        leaks = self._detect_leaks(wt_path, before)
-
-        test_passed = None
-        test_output = ""
-        if self.verify_cmd:
-            try:
-                if self.sandbox:
-                    # Verify in the same filesystem view as the rollout.
-                    # In particular, the project's venv is mounted at
-                    # worktree/.venv only inside bwrap; running pytest on the
-                    # host would see an empty mountpoint and falsely fail.
-                    cmd = sandbox_argv(
-                        wt_path,
-                        extra_readonly=self._sandbox_readonly(wt_path),
-                        include_opencode_state=False,
-                    ) + ["/bin/sh", "-c", self.verify_cmd]
-                    proc = subprocess.run(
-                        cmd,
-                        cwd=wt_path,
-                        env=sandbox_env(wt_path),
-                        capture_output=True,
-                        text=True,
-                        timeout=min(wall, 300),
-                    )
-                else:
-                    proc = subprocess.run(
-                        self.verify_cmd,
-                        cwd=wt_path,
-                        shell=True,
-                        capture_output=True,
-                        text=True,
-                        timeout=min(wall, 300),
-                    )
-                test_passed = proc.returncode == 0
-                test_output = (proc.stdout + "\n" + proc.stderr).strip()
-            except Exception as e:
-                test_passed = False
-                test_output = f"Execution error: {e}"
-            # The verdict goes into the output the selector reads. A test
-            # runner's own summary line is its own business -- with `-q` it
-            # may print none -- but the exit status is not ambiguous, and a
-            # selector shown only a diff cannot tell a passing candidate
-            # from a failing one.
-            test_output = (
-                f"VERIFICATION: {'PASSED' if test_passed else 'FAILED'} "
-                f"(exit status {0 if test_passed else 1})\n\n{test_output}"
-            )
-
-        self._verdicts[label] = bool(test_passed)
+        git_diff = self.wt_mgr.get_diff(self.session_id, label)
+        review = (
+            agent.critique(self.goal, git_diff, test_output, claims, strength)
+            if provider is not None and git_diff.strip()
+            else {"score": None, "issues": [], "unverified_claims": []}
+        )
+        log["review"] = review
 
         self.db.record_rollout(
             session_id=self.session_id,
@@ -384,159 +374,11 @@ class GeneralTaskAdapter:
         (run_dir / "diff.patch").write_text(git_diff, encoding="utf-8")
         (run_dir / "test_output.txt").write_text(test_output, encoding="utf-8")
         (run_dir / "worktree_path.txt").write_text(str(wt_path), encoding="utf-8")
-        if leaks:
-            (run_dir / "leaks.txt").write_text("\n".join(leaks) + "\n", encoding="utf-8")
-        traj = wt_path / ".harness_traj" / "trajectory.jsonl.gz"
-        if traj.is_file():
-            (run_dir / "trajectory.jsonl.gz").write_bytes(traj.read_bytes())
+        (run_dir / "candidate.json").write_text(
+            __import__("json").dumps({**log, "claims": claims, "test_passed": test_passed}, indent=2),
+            encoding="utf-8",
+        )
         return run_dir
-
-    def _sandbox_readonly(self, worktree: Path) -> list[tuple[Path, Path]]:
-        """What the rollout may read but not write, and where it may read it.
-
-        The project's own checkout is readable: a rollout working on a
-        project needs to see it. Its virtualenv is presented at the path a
-        worktree expects to find it, because a worktree has no environment
-        of its own.
-
-        The interpreter behind that virtualenv is usually *not* in the
-        project -- a uv-managed CPython, a pyenv build, a conda prefix --
-        and it is reached through a symlink. The sandbox hides the
-        operator's home, so the target of that symlink is bound in as well;
-        without it the rollout's ``.venv/bin/python`` is a dangling link.
-        """
-        pairs: list[tuple[Path, Path]] = [(self.repo_root, self.repo_root)]
-        venv = self.repo_root / ".venv"
-        if not venv.is_dir():
-            return pairs
-        # bwrap's target for --ro-bind must exist. A git worktree has no
-        # copy of the ignored virtualenv, so create an empty mountpoint; it
-        # is ignored by the repository and the source venv is only mounted
-        # over it inside the sandbox.
-        venv_target = worktree / ".venv"
-        venv_target.mkdir(parents=True, exist_ok=True)
-        pairs.append((venv, venv_target))
-        for interpreter in self._interpreters(venv):
-            if interpreter.is_dir() and interpreter not in {self.repo_root}:
-                pairs.append((interpreter, interpreter))
-        return pairs
-
-    def _interpreters(self, venv: Path) -> list[Path]:
-        """The real directories behind a virtualenv's python executables.
-
-        A uv-managed or pyenv interpreter is a whole installation, not a
-        single binary: it resolves its standard library relative to the
-        executable, so the prefix around it has to be bound in as well.
-        """
-        found: list[Path] = []
-        for name in ("python", "python3"):
-            link = venv / "bin" / name
-            if not link.is_symlink():
-                continue
-            try:
-                real = link.resolve(strict=True)
-            except OSError:
-                continue
-            if not real.is_file():
-                continue
-            # <prefix>/bin/python -> <prefix>
-            prefix = real.parent.parent if real.parent.name == "bin" else real.parent
-            if prefix not in found:
-                found.append(prefix)
-        return found
-
-    def _authored_paths(self, worktree: Path) -> list[str]:
-        """The harness-authored paths in this worktree, from the launcher's record."""
-        marker = worktree / ".harness_authored"
-        if not marker.is_file():
-            return []
-        return [ln for ln in marker.read_text(encoding="utf-8").splitlines() if ln.strip()]
-
-    def _detect_leaks(self, worktree: Path, before: set[str]) -> list[str]:
-        """What the rollout left outside its own worktree.
-
-        The worktree is a git worktree of the user's repository, so a write
-        outside it is either in the user's tree or in some other repository
-        entirely -- the case that produced a stray ``fix-calc/`` directory
-        inside the harness's own checkout.
-
-        Two things are checked:
-
-        * the **worktree registry** of the user's repository, for entries
-          that appeared during the rollout;
-        * the **user's own working tree**, for files that appeared during
-          the rollout. The state before the rollout is subtracted, so the
-          harness's own housekeeping (the ``.gitignore`` entry it adds, for
-          instance) is not mistaken for a leak.
-
-        The check is a report, not a prevention: the fence has already
-        denied the paths it can see. This catches the paths it cannot.
-        """
-        leaks: list[str] = []
-        try:
-            leaks.extend(self._leaked_worktrees(worktree))
-        except Exception:
-            pass
-        try:
-            leaks.extend(self._leaked_files(before))
-        except Exception:
-            pass
-        return leaks
-
-    def _tree_state(self) -> set[str]:
-        """The paths the user's working tree currently reports as changed."""
-        try:
-            res = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=self.repo_root,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except Exception:
-            return set()
-        return {ln[3:].strip() for ln in res.stdout.splitlines() if len(ln) >= 4}
-
-    def _leaked_worktrees(self, worktree: Path) -> list[str]:
-        """Worktrees registered against the user's repository, outside ours."""
-        out: list[str] = []
-        try:
-            res = subprocess.run(
-                ["git", "worktree", "list", "--porcelain"],
-                cwd=self.repo_root,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except Exception:
-            return out
-        ours = str(worktree.resolve())
-        for line in res.stdout.splitlines():
-            if not line.startswith("worktree "):
-                continue
-            path = line[len("worktree ") :].strip()
-            if path == ours or str(self.repo_root) == path:
-                continue
-            # A worktree of the user's repo that is not ours, and that is not
-            # one of the harness's own rollouts.
-            if path.startswith(str(self.harness_dir.resolve())):
-                continue
-            if "harness2" in path or "harness2-prop" in path:
-                continue
-            out.append(f"worktree registered outside the rollout: {path}")
-        return out
-
-    def _leaked_files(self, before: set[str]) -> list[str]:
-        """Files in the user's working tree that the rollout added."""
-        return [
-            f"file in the user's tree: {name}"
-            for name in sorted(self._tree_state() - before)
-            if not name.startswith(".harness")
-        ]
-
-    # ------------------------------------------------------------------
-    # evidence
-    # ------------------------------------------------------------------
 
     def delivered(self, run_dir: Path) -> bool:
         """Did the rollout produce anything the selector can look at?"""

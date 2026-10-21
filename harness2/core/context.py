@@ -475,6 +475,19 @@ _MARKER_SCAN_SUFFIXES = frozenset(
 )
 
 
+# Generic JSON-key markers ("passed_count", ...) legitimately appear in ordinary source code
+# (audit scripts, test helpers). Scanning code bodies for them halted whole runs on false
+# positives, so in source files only the distinctive grader-output markers are checked.
+_GENERIC_KEY_MARKERS = frozenset({'"passed_count"', '"pass_rate"', '"test_pass_rate"'})
+_CODE_SUFFIXES = frozenset({".py", ".js", ".ts", ".sh", ".rb", ".go", ".rs", ".java"})
+
+
+def _markers_for(name: str, markers: Sequence[str]) -> Sequence[str]:
+    if Path(name).suffix.lower() in _CODE_SUFFIXES:
+        return [m for m in markers if m not in _GENERIC_KEY_MARKERS]
+    return markers
+
+
 def assert_no_grader_verdicts(
     root: Path | str, markers: Sequence[str] = GRADER_VERDICT_MARKERS
 ) -> None:
@@ -503,7 +516,7 @@ def assert_no_grader_verdicts(
             body = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        for m in markers:
+        for m in _markers_for(p.name, markers):
             if m in body:
                 where = body.index(m)
                 raise ValueError(
@@ -531,7 +544,7 @@ def assert_tree_has_no_grader_verdicts(
         if Path(rel).suffix.lower() not in _MARKER_SCAN_SUFFIXES:
             continue
         body = str(tree[rel])
-        for m in markers:
+        for m in _markers_for(rel, markers):
             if m in body:
                 where = body.index(m)
                 raise ValueError(

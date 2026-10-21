@@ -44,7 +44,7 @@ server = MCPServer(
         "Harness² MCP Server: Automates recursive agent harnessing (Propose-Probe-Compose), "
         "SQLite-backed persistent session & long-term memory, and isolated worktree execution."
     ),
-    version="0.4.0",
+    version="0.5.0",
 )
 
 
@@ -310,47 +310,123 @@ def harness2_apply_harness(
     }
 
 
+def _rank_key(c: Dict[str, Any]) -> tuple:
+    review = c.get("review") or {}
+    high = sum(1 for i in review.get("issues", []) if str(i.get("severity")).lower() == "high")
+    score = review.get("score")
+    return (
+        1 if c.get("test_passed") is True else (0 if c.get("test_passed") is None else -1),
+        1 if c.get("has_changes") else 0,
+        -high,
+        score if isinstance(score, (int, float)) else -1,
+    )
+
+
+def _candidate_summary(label: str, run_dir: Path) -> Dict[str, Any]:
+    meta = json.loads((run_dir / "candidate.json").read_text(encoding="utf-8"))
+    diff = (run_dir / "diff.patch").read_text(encoding="utf-8")
+    return {
+        "label": label,
+        "strategy": meta.get("strategy"),
+        "test_passed": meta.get("test_passed"),
+        "has_changes": bool(diff.strip()),
+        "review": meta.get("review"),
+        "claims": meta.get("claims", []),
+        "errors": meta.get("errors", []),
+        "worktree_path": (run_dir / "worktree_path.txt").read_text(encoding="utf-8"),
+        "diff": diff,
+        "verification_output": (run_dir / "test_output.txt").read_text(encoding="utf-8")[-4000:],
+    }
+
+
 @server.tool()
 def harness2_solve(
     goal: str,
     workspace: str,
     verify_cmd: Optional[str] = None,
     domain: str = "general",
+    k: int = 2,
+    repair_rounds: int = 1,
+    context_files: Optional[List[str]] = None,
+    timeout: int = 600,
 ) -> Dict[str, Any]:
-    """Initiate a general task run inside an isolated git worktree without altering main.
+    """Generate k candidate solutions with the configured LLM, each in its own git worktree.
 
-    Creates a session record in SQLite (.harness2/memory.db) and executes candidate rollouts
-    in isolated git worktrees. The worktrees stay intact for inspection until harness2_finish is called.
+    Each candidate: LLM edits (distinct strategy) -> verify_cmd -> one repair round on failure
+    -> independent LLM critique of the diff (numbers, citations, leakage, bugs). Candidates are
+    ranked (tests passed > has changes > fewest high-severity issues > critic score) and a
+    recommendation is ALWAYS returned with every candidate for review. Nothing touches the
+    main working tree until harness2_finish(action='accept').
+
+    verify_cmd runs via the shell inside the worktree with your environment. Existence/grep
+    checks are reported as verification_strength='weak' and never count as proof.
 
     Args:
-        goal: The task goal or problem to solve.
+        goal: The task to accomplish.
         workspace: Path to the target git repository.
-        verify_cmd: Optional verification command to test changes (e.g. 'pytest', 'npm test').
-        domain: Domain or project category (default: 'general').
+        verify_cmd: Command that exits 0 on success (e.g. 'pytest -q tests/test_x.py').
+        domain: Category used for memory/lessons.
+        k: Number of candidates (1-3; strategies: minimal, skeptical, thorough).
+        repair_rounds: Extra LLM attempts per candidate after a failed verification.
+        context_files: Repo-relative files the solver must read.
+        timeout: Seconds for each verification run.
     """
     ws = Path(workspace).expanduser().resolve()
     if not (ws / ".git").exists():
         return {"status": "error", "message": f"{ws} is not a git repository."}
+    from harness2 import llm
+    from harness2.adapters import agent
 
+    provider = llm.resolve_provider()
     adapter = GeneralTaskAdapter(repo_root=ws, goal=goal, domain=domain, verify_cmd=verify_cmd)
     sess_id = adapter.session_id
+    strategies = ["minimal", "skeptical", "thorough"][: max(1, min(3, k))]
 
-    run_dir = adapter.execute(task_id=sess_id, harness_dir=None, run_id="probe_1")
+    candidates: List[Dict[str, Any]] = []
+    for i, strat in enumerate(strategies, 1):
+        label = f"cand{i}_{strat}"
+        try:
+            run_dir = adapter.execute(
+                sess_id, None, label, timeout=timeout, strategy=strat,
+                repair_rounds=repair_rounds, extra_files=context_files,
+            )
+            candidates.append(_candidate_summary(label, run_dir))
+        except Exception as e:  # one failing candidate must not sink the session
+            candidates.append({"label": label, "strategy": strat, "errors": [str(e)], "has_changes": False})
 
-    diff_text = adapter.deliverable_text(run_dir)
-    test_out = (run_dir / "test_output.txt").read_text(encoding="utf-8")
-    wt_path = (run_dir / "worktree_path.txt").read_text(encoding="utf-8")
+    ranked = sorted(candidates, key=_rank_key, reverse=True)
+    best = ranked[0]
+    (adapter.spec.runs_root / sess_id).mkdir(parents=True, exist_ok=True)
+    (adapter.spec.runs_root / sess_id / "selection.json").write_text(
+        json.dumps({"recommended": best["label"], "ranking": [c["label"] for c in ranked]}, indent=2),
+        encoding="utf-8",
+    )
+
+    strength = agent.verification_strength(verify_cmd)
+    warnings: List[str] = []
+    if provider is None:
+        warnings.append("No LLM configured (set INCEPTION_API_KEY in harness2/.env): no code was generated.")
+    if strength != "executable":
+        warnings.append(f"Verification is {strength}: a pass does not establish correctness.")
+    high = [i for i in (best.get("review") or {}).get("issues", []) if str(i.get("severity")).lower() == "high"]
+    if high:
+        warnings.append(f"Critic found {len(high)} high-severity issue(s) in the recommended candidate.")
+    if (best.get("review") or {}).get("unverified_claims"):
+        warnings.append("Recommended candidate has unverified claims; check them before accepting.")
+    if not best.get("has_changes"):
+        warnings.append("Recommended candidate made no changes.")
 
     return {
-        "status": "ready_for_review",
+        "status": "needs_human_review" if warnings else "ready_for_review",
         "session_id": sess_id,
-        "worktree_path": wt_path,
-        "git_diff": diff_text,
-        "verification_output": test_out,
-        "instructions": (
-            f"Review changes in worktree '{wt_path}'. "
-            f"When finished, call harness2_finish(session_id='{sess_id}', workspace='{workspace}', action='accept'|'discard') "
-            "to clean up the worktree."
+        "llm": provider.public() if provider else None,
+        "verification_strength": strength,
+        "recommended": best["label"],
+        "warnings": warnings,
+        "candidates": ranked,
+        "next": (
+            f"harness2_finish(session_id='{sess_id}', workspace='{ws}', action='accept'|'discard', "
+            f"rollout_label='<optional override>')"
         ),
     }
 
@@ -360,72 +436,106 @@ def harness2_finish(
     session_id: str,
     workspace: str,
     action: str = "accept",
+    rollout_label: Optional[str] = None,
     learned_facts: Optional[List[Dict[str, str]]] = None,
+    keep_worktrees: bool = False,
 ) -> Dict[str, Any]:
-    """Finalize a session, apply or discard changes, run self-evolution, and delete worktrees.
+    """Accept (apply one candidate's diff to the working tree, unstaged-safe) or discard a session.
 
-    Selects the best rollout (prioritizing test_passed=1), applies genuine code changes without
-    leaking internal scaffolding, triggers the self-evolution engine, and prunes the worktree.
+    Applies the recommended candidate from harness2_solve unless rollout_label overrides it,
+    records learned facts, runs self-evolution, and deletes the session's worktrees/branches.
 
     Args:
-        session_id: The session ID returned by harness2_solve.
+        session_id: Session ID from harness2_solve.
         workspace: Path to the target git repository.
-        action: 'accept' (applies diff to repository and records memory) or 'discard' (cleans up without changes).
-        learned_facts: Optional list of facts to record into SQLite long-term memory.
+        action: 'accept' or 'discard'.
+        rollout_label: Candidate label to apply instead of the recommendation.
+        learned_facts: [{'category': ..., 'fact': ..., 'evidence': ...}] to store in memory.
+        keep_worktrees: Keep worktrees for further inspection instead of deleting them.
     """
     ws = Path(workspace).expanduser().resolve()
     db = MemoryDB(ws / ".harness2" / "memory.db")
-    wt_mgr = WorktreeManager(ws)
-
+    wt_root = ws / ".harness2" / "worktrees"
+    wt_mgr = WorktreeManager(ws, base_temp_dir=wt_root if wt_root.is_dir() else None)
     session = db.get_session(session_id)
     if not session:
         return {"status": "error", "message": f"Session {session_id} not found."}
+    if action not in ("accept", "discard"):
+        return {"status": "error", "message": "action must be 'accept' or 'discard'."}
 
+    chosen = None
     applied = False
-    chosen_label = None
-
+    evolution_result: Dict[str, Any] = {"status": "skipped"}
     if action == "accept":
-        rollouts = session.get("rollouts", [])
-        if rollouts:
-            # Select the best rollout: first prioritize test_passed == 1
-            passed_rollouts = [r for r in rollouts if r.get("test_passed") == 1]
-            chosen_rollout = passed_rollouts[0] if passed_rollouts else rollouts[-1]
-            chosen_label = chosen_rollout["label"]
-
-            wt_mgr.apply_to_repo(session_id, chosen_label)
+        labels = [r["label"] for r in session.get("rollouts", [])]
+        sel_file = ws / ".harness2" / "runs" / session_id / "selection.json"
+        if rollout_label:
+            chosen = rollout_label
+        elif sel_file.is_file():
+            chosen = json.loads(sel_file.read_text(encoding="utf-8")).get("recommended")
+        else:
+            passed = [r for r in session.get("rollouts", []) if r.get("test_passed") == 1]
+            chosen = (passed or session.get("rollouts", [{}]))[0].get("label")
+        if chosen not in labels:
+            return {"status": "error", "message": f"Unknown rollout {chosen!r}; choose from {labels}."}
+        try:
+            wt_mgr.apply_to_repo(session_id, chosen)
             applied = True
-
-        # Store explicit user/agent learned facts
-        if learned_facts:
-            for item in learned_facts:
-                if "category" in item and "fact" in item:
-                    db.add_longterm_fact(
-                        category=item["category"],
-                        fact=item["fact"],
-                        confidence=float(item.get("confidence", 1.0)),
-                        evidence=item.get("evidence"),
-                    )
-
-        # Trigger Self-Evolution Engine: automatically synthesize lessons, facts, and skills
-        evolution_engine = SelfEvolutionEngine(ws, db=db)
-        evolution_result = evolution_engine.analyze_session(session_id)
-
-        db.close_session(session_id, status="accepted", best_rollout_id=chosen_label)
+        except Exception as e:
+            return {"status": "error", "message": f"Apply failed, nothing cleaned up: {e}"}
+        for item in learned_facts or []:
+            if item.get("category") and item.get("fact"):
+                db.add_longterm_fact(
+                    item["category"], item["fact"], float(item.get("confidence", 1.0)), item.get("evidence")
+                )
+        evolution_result = SelfEvolutionEngine(ws, db=db).analyze_session(session_id)
+        db.close_session(session_id, status="accepted", best_rollout_id=chosen)
     else:
         db.close_session(session_id, status="discarded")
-        evolution_result = {"status": "skipped", "message": "Session discarded"}
 
-    # Prune and delete all worktrees associated with this session
-    cleaned_worktrees = wt_mgr.cleanup_session(session_id)
-
+    cleaned = [] if keep_worktrees else wt_mgr.cleanup_session(session_id)
     return {
         "status": "finished",
         "action": action,
-        "chosen_rollout": chosen_label,
+        "chosen_rollout": chosen,
         "applied_to_repository": applied,
-        "deleted_worktrees": cleaned_worktrees,
+        "deleted_worktrees": cleaned,
         "self_evolution": evolution_result,
+        "note": "Changes are applied to the working tree only; review `git diff` and commit yourself.",
     }
+
+
+@server.tool()
+def harness2_config_status() -> Dict[str, Any]:
+    """Report which LLM provider/model the MCP server will use and whether it is reachable."""
+    from harness2 import llm
+
+    p = llm.resolve_provider()
+    if p is None:
+        return {"configured": False, "hint": "Set INCEPTION_API_KEY in harness2/.env"}
+    try:
+        reply = llm.chat([{"role": "user", "content": "Reply with: OK"}], max_tokens=512, retries=1)
+        return {"configured": True, **p.public(), "reachable": True, "sample": reply.strip()[:40]}
+    except llm.LLMError as e:
+        return {"configured": True, **p.public(), "reachable": False, "error": str(e)[:400]}
+
+
+@server.tool()
+def harness2_list_sessions(workspace: str, status: Optional[str] = None) -> Dict[str, Any]:
+    """List Harness² sessions in a workspace (optionally filter by status: active/accepted/discarded)."""
+    ws = Path(workspace).expanduser().resolve()
+    db_file = ws / ".harness2" / "memory.db"
+    if not db_file.is_file():
+        return {"sessions": []}
+    import sqlite3
+
+    con = sqlite3.connect(db_file)
+    con.row_factory = sqlite3.Row
+    q = "SELECT session_id, goal, domain, status, best_rollout_id, created_at, closed_at FROM sessions"
+    rows = con.execute(q + (" WHERE status=?" if status else "") + " ORDER BY created_at DESC",
+                       (status,) if status else ()).fetchall()
+    con.close()
+    return {"sessions": [dict(r) for r in rows]}
 
 
 @server.tool()
