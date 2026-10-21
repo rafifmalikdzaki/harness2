@@ -54,10 +54,15 @@ https://github.com/user-attachments/assets/76b10548-b14b-4c8f-9aa5-a93662df4d56
 ## Contents
 
 - [Video overview](#video-overview)
+- [How Harness² Works](#how-harness-works)
 - [Harness components](#harness-components)
 - [Install](#install)
+- [Docker Deployment](#docker-deployment)
+- [General Task Runner (`harness2-general`)](#general-task-runner-harness2-general)
 - [Run a benchmark](#run-a-benchmark)
-- [Model Context Protocol (MCP) Integration](#model-context-protocol-mcp-integration)
+- [Model Context Protocol (MCP) Server](#model-context-protocol-mcp-server)
+- [Persistent Memory & Self-Evolution](#persistent-memory--self-evolution)
+- [Best Practices & Tips](#best-practices--tips)
 - [Experiments](#experiments)
 - [Web access](#web-access)
 - [Results and resume](#results-and-resume)
@@ -65,6 +70,33 @@ https://github.com/user-attachments/assets/76b10548-b14b-4c8f-9aa5-a93662df4d56
 - [Contributing](#contributing)
 - [License](#license)
 - [Disclaimer](#disclaimer)
+
+## How Harness² Works
+
+Model weights are frozen, but real software environments are messy, fragile, and dynamic. Rather than allowing an LLM to edit files directly on your active git branch—where syntax errors, broken imports, and hallucinated test passes can corrupt your project—Harness² wraps the LLM in an **isolated, scientific experimentation loop**:
+
+```mermaid
+flowchart TD
+    User["User Goal & Repo State"] --> Memory["1. Substrate & MemoryDB<br/>(Injects past lessons & constraints)"]
+    Memory --> Gen["2. Propose Divergent Candidates<br/>(Minimal vs. Skeptical vs. Thorough)"]
+    Gen --> WT1["Worktree A (Sandbox)"]
+    Gen --> WT2["Worktree B (Sandbox)"]
+    WT1 --> Verify1["Execute & Verify Command"]
+    WT2 --> Verify2["Execute & Verify Command"]
+    Verify1 --> Critic["3. Probe & Independent Critic<br/>(Audit diffs & check claims)"]
+    Verify2 --> Critic
+    Critic --> Compare["4. Compose / Select Winner<br/>(Best verified candidate)"]
+    Compare --> Review["5. User Review (Diff Preview)"]
+    Review --> Apply["harness2_finish(accept)<br/>Clean patch applied to main"]
+    Apply --> Evolve["6. Self-Evolution<br/>(Lessons & skills stored in SQLite)"]
+```
+
+1. **Context & Memory Retrieval:** Pulls past failure modes, architectural guardrails, and project conventions from `.harness2/memory.db`.
+2. **Divergent Propose:** Generates competing candidate strategies (`minimal`, `skeptical`, `thorough`) instead of relying on a single guess.
+3. **Sandboxed Probing:** Spins up detached, isolated git worktrees (`.harness2/worktrees/`). Your `main` branch and active working directory remain 100% untouched.
+4. **Verification Gates:** Runs real test and lint commands inside the sandbox.
+5. **Independent Critic:** An adversarial inspection checks whether tests genuinely pass and flags hallucinated claims or placeholder code.
+6. **Compose & Self-Evolution:** The winning patch is presented cleanly. Upon acceptance, facts and procedural skills are stored for subsequent tasks.
 
 ## Harness components
 
@@ -94,79 +126,74 @@ harness2-demo --output runs/demo --k 2
 The local demo runs both recursion modes with deterministic editors and real
 Python executions. It requires no model credentials.
 
-For model-backed benchmarks, install **Node.js 20+, the Google Cloud CLI**, and
-the [benchmark dependencies](docs/SETUP.md#requirements). LAB needs Pandoc and
-Poppler; WorkBuddy-Bench needs Docker. Then configure your models:
-
+For model-backed runs, configure your API keys in `.env`:
 ```bash
 cp .env.example .env
-# Edit .env with your Vertex AI project and model IDs.
-gcloud auth application-default login
+
+# Configure whichever LLM providers you use:
+# 1. Inception Labs (fast & efficient code reasoning)
+export INCEPTION_API_KEY="your-inception-key"
+export HARNESS2_SOLVER_MODEL="inception/mercury-3"
+export HARNESS2_IMPROVER_MODEL="inception/mercury-3"
+
+# 2. OpenAI / Anthropic / Gemini
+export OPENAI_API_KEY="your-openai-key"
+export ANTHROPIC_API_KEY="your-anthropic-key"
+export GEMINI_API_KEY="your-gemini-key"
 ```
 
-See the [setup guide](docs/SETUP.md) for model settings, authentication
-alternatives, and the [Codex executor](docs/SETUP.md#codex-executor).
+---
 
-## Run a benchmark
+## Docker Deployment
 
-The following example installs LAB and runs one task, then evaluates and reports
-its result. Model-backed runs incur API costs; start with a small task selection.
+Harness² can be run fully containerized to isolate its dependencies and provide reproducible execution:
 
 ```bash
-harness2-setup lab
-harness2-check --bench lab
-harness2 --bench lab --k 1 --mode parallel \
-  --only-domains antitrust-competition --max-tasks 1
-harness2-judge --bench lab --k 1 --mode parallel
-harness2-report --bench lab --k 1 --mode parallel
+# Build the Docker image
+docker build -t harness2:latest .
+
+# Run the MCP Server inside Docker over stdio
+docker run -i --rm \
+  -e INCEPTION_API_KEY="your-key" \
+  -v /path/to/your/workspace:/workspace \
+  harness2:latest harness2-mcp
 ```
 
-Sequential recursion runs the same commands with `--mode sequential`. `--k` is
-the task-level recursion budget; see [Experiments](#experiments). Judging and
-reporting must use the same benchmark, executor, subset, `--k`, `--mode`, and
-seed as the refinement run. Add `--dry-run` to `harness2` to preview task
-selection without model calls.
+Or run via `docker-compose`:
+```bash
+# Start background services or execute commands inside the container
+docker-compose run --rm harness2 harness2-general --workspace /workspace --goal "..."
+```
 
-| Benchmark | Tasks | Install | Guide |
-|---|---|---|---|
-| JobBench | Professional work | `harness2-setup jb` | [JobBench](docs/BENCHMARKS.md#jobbench) |
-| LAB | Legal work | `harness2-setup lab` | [LAB](docs/BENCHMARKS.md#lab) |
-| WorkBuddy-Bench | Office, web, and code | `harness2-setup wb` | [WorkBuddy](docs/BENCHMARKS.md#workbuddy-bench) |
+---
 
-Choose one benchmark per command. WorkBuddy also takes `--subset office`,
-`--subset web`, or `--subset code` on every command after setup. The
-[benchmark guides](docs/BENCHMARKS.md) cover each one's data, domains, and
-grading.
+## General Task Runner (`harness2-general`)
 
-## Run on your own repository (general task harness)
-
-No benchmark, no dataset, no judge. Point the engine at a git repository and
-a goal, and the same Propose-Probe-Compose loop runs:
+No benchmark, no dataset, no judge. Point the engine at any git repository and a goal, and the same Propose-Probe-Compose loop executes:
 
 ```bash
-export HARNESS2_SOLVER_MODEL=anthropic/claude-sonnet-4-5      # the solver
-export HARNESS2_IMPROVER_MODEL=anthropic/claude-sonnet-4-5    # the proposer/selector
-
-harness2-general --workspace ~/Research/histodae \
-  --goal "make --config-path accept a packaged config name" \
+harness2-general --workspace ~/my-project \
+  --goal "Add exponential backoff retry logic to api/client.py and verify with tests" \
+  --verify "pytest tests/test_client.py -q" \
   --k 2 --mode parallel
 ```
 
-Each candidate harness is probed by running OpenCode in an **isolated git
-worktree**; the winning rollout's changes are left in that worktree for
-review and are not applied to your repository unless you ask for it. The
-harness the improver edited (its `AGENTS.md`, `.opencode/`, `scripts/`) is
-scaffolding and stays out of the deliverable, so the diff you review is the
-agent's work and nothing else.
+### CLI Parameters
 
-Add `--verify "pytest -q"` to grade a rollout by its exit status; with no
-verifier the selection is made purely on the contrast between candidates.
-Lessons land in the project's experience library under
-`<workspace>/.harness2/library/` and are offered to the next run through the
-harness's `LongTermMEMORY.md` component.
+| Flag | Default | Description |
+|---|---|---|
+| `--workspace` | *(required)* | Path to the target git repository. |
+| `--goal` | *(required)* | Clear instruction of what the agent should accomplish. |
+| `--verify` | `None` | Shell command run inside the sandbox to verify candidate correctness (e.g. `pytest -q`, `npm test`, `cargo test`). |
+| `--k` | `2` | Number of candidate strategies to generate and evaluate. |
+| `--mode` | `parallel` | `parallel` (probes $k$ candidates and composes evidence) or `sequential` (successive refinement). |
+| `--model` | `HARNESS2_SOLVER_MODEL` | LLM used to write code changes (e.g. `inception/mercury-3`, `openai/gpt-4o`). |
+| `--improver-model` | `HARNESS2_IMPROVER_MODEL` | LLM used for candidate proposal and independent critic auditing. |
+| `--timeout` | `1800` | Timeout per candidate execution in seconds. |
+| `--no-sandbox` | `False` | Disables Bubblewrap (`bwrap`) isolation if running in environments where unprivileged user namespaces are disabled. |
 
-The same thing is available to any MCP client as the `harness2_recursion`
-tool.
+### Zero Branch Clutter (Detached Sandboxes)
+Harness² runs all candidate probes inside detached git worktrees at `.harness2/worktrees/`. **Zero branches are created in `git branch`**, leaving your active branch and working directory untouched. When the run finishes, temporary worktrees are automatically pruned.
 
 ### Keeping the memory bounded
 
@@ -180,12 +207,7 @@ Transcripts are stored compressed, the record's large fields are
 compressed, library entries a newer entry supersedes are retired, and a
 retention policy keeps the recent runs in full while older runs keep their
 conclusions and lose their transcripts. The policy runs at the end of every
-general run, and can be inspected or applied directly:
-
-```bash
-# through MCP, from any agent
-harness2_memory_status(workspace="<repo>", prune=true)
-```
+general run, and can be inspected or applied directly via `harness2_query_memory`.
 
 **[docs/FINDINGS.md](docs/FINDINGS.md)** records every bottleneck this
 harness hit — the disk blow-up, the isolation escapes, the runtime
@@ -194,7 +216,35 @@ was done about it.
 **[docs/GENERAL_HARNESS_EXPERIMENTS.md](docs/GENERAL_HARNESS_EXPERIMENTS.md)**
 is the working log of the experiments that found them.
 
-## Model Context Protocol (MCP) Integration
+---
+
+## Run a benchmark
+
+Harness² supports standardized research benchmarks including **JobBench**, **LAB**, and **WorkBuddy-Bench**:
+
+```bash
+# Setup benchmark data and environments
+harness2-setup lab
+harness2-check --bench lab
+
+# Run benchmark evaluation
+harness2 --bench lab --k 1 --mode parallel \
+  --only-domains antitrust-competition --max-tasks 1
+
+# Judge and generate report
+harness2-judge --bench lab --k 1 --mode parallel
+harness2-report --bench lab --k 1 --mode parallel
+```
+
+| Benchmark | Tasks | Install | Guide |
+|---|---|---|---|
+| JobBench | Professional work | `harness2-setup jb` | [JobBench](docs/BENCHMARKS.md#jobbench) |
+| LAB | Legal work | `harness2-setup lab` | [LAB](docs/BENCHMARKS.md#lab) |
+| WorkBuddy-Bench | Office, web, and code | `harness2-setup wb` | [WorkBuddy](docs/BENCHMARKS.md#workbuddy-bench) |
+
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for full instructions, domain splits, and grading details.
+
+## Model Context Protocol (MCP) Server
 
 Harness² includes an official **MCP Server** (`harness2-mcp`) that exposes recursive agent harnessing capabilities, domain experience library queries, benchmark diagnostics, and harness materialization to external coding agents (**Claude Code**, **OpenCode**, **Codex**, and **Antigravity**).
 
@@ -288,43 +338,80 @@ Add to `~/.gemini/config/mcp_config.json`:
 
 ---
 
+### MCP Tools Reference (8 Exposed Tools)
+
+The Harness² MCP server exposes 8 production-ready tools for IDEs and autonomous agents:
+
+| Tool | Parameters | Description |
+|---|---|---|
+| `harness2_solve` | `goal`, `workspace`, `verify_cmd`, `domain`, `k`, `mode`, `timeout` | **Main task solver:** Spawns divergent candidate rollouts (`minimal`, `skeptical`, `thorough`) in isolated git worktrees, verifies with tests, audits with an independent critic, and selects the winning rollout without modifying your repository. |
+| `harness2_finish` | `session_id`, `action` (`accept` or `discard`), `workspace`, `rollout_label` | **Lifecycle finalizer:** `accept` applies the candidate's diff cleanly to your main tree and saves learned facts/skills; `discard` cleans up temporary sandboxes and reverts state. |
+| `harness2_query_memory` | `workspace`, `category`, `limit` | **Institutional memory query:** Reads structured facts, session histories, lessons, and project conventions from SQLite (`.harness2/memory.db`). |
+| `harness2_apply_harness` | `harness_path`, `target_workspace`, `dry_run`, `backup` | **Harness materialization:** Installs synthesized guardrails and skills into active workspaces with single-pass collision-free merge and `.bak` protection. |
+| `harness2_inspect_library` | `domain`, `workspace` | **Experience library reader:** Inspects synthesized domain cues, heuristics, and reusable scripts from `.harness2/library/`. |
+| `harness2_list_sessions` | `workspace`, `limit` | **Session auditor:** Lists active and recent task sessions, showing candidate scores, test pass/fail states, and chosen winners. |
+| `harness2_config_status` | *(none)* | **Environment diagnostic:** Verifies configured API keys (Inception, OpenAI, Anthropic, Gemini), active models, and toolchain readiness. |
+| `harness2_run_demo` | `k`, `mode` | **Offline verification:** Runs deterministic offline Propose-Probe-Compose recursion without external API calls. |
+
+---
+
 ### Natural Language Examples (Prompts for Your Agent)
 
 Once connected, your coding agent can invoke Harness² tools directly in response to natural language prompts:
 
-#### 1. Running an Offline Recursion Demo
-> *"Run the Harness2 demo with budget k=2 in both parallel and sequential modes, and show me the execution count and task completion status."*
-- Calls `harness2_run_demo(k=2, mode="both")`.
-- Demonstrates task-level Propose–Probe–Compose steps on synthetic ledger tasks without making external model calls.
+#### 1. Safely Solving a Task in an Isolated Sandbox
+> *"Implement exponential backoff in `api/client.py` and run tests in an isolated worktree. Show me the diff before touching my repo."*
+- Agent calls `harness2_solve(goal="...", workspace=".", verify_cmd="pytest tests/test_client.py")`.
+- Candidate rollouts execute in detached worktrees; an independent critic audits changes and verifies the test command.
+- Returns the diff and reviewer notes.
 
-#### 2. Querying Discovered Domain Knowledge
-> *"Inspect the Harness2 experience library for the 'accounting' domain. What cues, lessons, and scripts did past tasks discover?"*
-- Calls `harness2_inspect_library(domain="accounting")`.
-- Returns recorded heuristics (e.g. handling credit/debit signs) and synthesized scripts/skills.
+#### 2. Reviewing and Accepting the Winner
+> *"The diff looks great. Accept rollout probe_1 and save the lessons learned."*
+- Agent calls `harness2_finish(session_id="...", action="accept")`.
+- Applies the patch cleanly to the active branch, prunes worktrees, and saves facts/skills to SQLite.
 
-#### 3. Materializing Synthesized Harnesses into Your Active Workspace
-> *"Apply the synthesized accounting harness to my current workspace."*
-- Calls `harness2_apply_harness(harness_path="...", target_workspace=".")`.
-- Automatically maps components to the client's preferred conventions (`AGENTS.md` for Codex, `.gemini/rules/` and `.gemini/skills/` for Antigravity, or `systemprompt.md` for OpenCode).
+#### 3. Querying Past Lessons & Memory
+> *"What lessons did Harness² record about our database migrations or API errors?"*
+- Agent calls `harness2_query_memory(workspace=".", category="lesson")`.
+- Returns categorized heuristics and failure modes encountered in past runs.
 
-#### 4. Checking Benchmark Readiness
-> *"Check if the LAB and JobBench benchmarks are installed and ready for evaluation under OpenCode."*
-- Calls `harness2_benchmark_status(bench="lab", substrate="oc")`.
-- Validates pinned dependencies and environment health before starting benchmark sweeps.
+---
 
-#### 5. Running the Real Loop on Your Own Repository
-> *"Use Harness² to work out how to add a `--config-path` flag to this project that accepts a packaged config name, then show me the diff."*
-- Calls `harness2_recursion(goal="...", workspace=".", k=1, mode="parallel")`.
-- Runs the real Propose–Probe–Compose loop: an improver model proposes harness
-  edits, each candidate is probed by running OpenCode in an isolated git
-  worktree, and a selector model picks the winner by reading the candidates.
-- The result is a diff and a worktree path; nothing is applied to your
-  repository until you call `harness2_finish(action="accept")`.
+## Persistent Memory & Self-Evolution
 
-#### 6. Solving a Task in an Isolated Worktree
-> *"Run this task in a sandbox and let me review the diff before it touches my repo."*
-- Calls `harness2_solve(goal="...", workspace=".", verify_cmd="pytest -q")`.
-- Cheaper than the full loop: one worktree, one command, one diff.
+Harness² features a dual-layer institutional memory engine:
+
+1. **SQLite Memory Engine (`.harness2/memory.db`):**
+   * **Sessions & Rollouts:** Full record of every candidate approach, strategy tag, and critic audit score.
+   * **Facts & Lessons:** Extracted domain facts (`conventions`, `pitfalls`, `architecture`, `commands`).
+   * **Component Rendering:** Automatically formats long-term memory into component `c3` (`LongTermMEMORY.md`) so subsequent runs don't repeat mistakes.
+
+2. **Self-Evolution & Procedural Skills (`.harness2/skills/`):**
+   * When winning solutions introduce reusable procedures or scripts, Harness² self-evolves by saving modular skill files into `.harness2/skills/`.
+   * Future agent sessions can inspect and invoke these skills directly.
+
+---
+
+## Best Practices & Tips
+
+### 1. Slice Tasks Into 1–2 File Deliverables
+Language models have bounded output token limits. Asking an LLM to generate 5 complex modules and their tests in a single shot often causes truncated JSON replies (`Unterminated string`).
+* **Recommended:** Slice tasks into modular, iterative goals (e.g. Slice 1: Model architecture + unit test; Slice 2: Dataset loader + unit test; Slice 3: CLI integration).
+
+### 2. Choose the Right Recursion Budget ($k$)
+* **$k=1$ (Fast):** Generates 1 candidate. Best for small bugfixes or rapid prototyping (~1–2 minutes).
+* **$k=2$ (Balanced):** Compares contrasting strategies (`minimal` vs `skeptical`) with independent verification (~3–4 minutes).
+* **$k=4$ (Deep):** Comprehensive search for non-trivial architectural problems.
+
+### 3. Real-Time Run Monitoring
+When running long tasks in the background:
+```bash
+# Check running sessions and candidate states
+harness2-mcp  # or inspect via harness2_list_sessions
+
+# Tail the latest candidate output
+watch -n 2 "ls -lt .harness2/runs/ | head -n 10"
+```
 
 ## Experiments
 
