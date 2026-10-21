@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
+from ..core.compress import compress_text
 from ..substrate.opencode import opencode_command
 from ..substrate.render import render_opencode_tree
 
@@ -198,8 +199,10 @@ def run_opencode_in_workspace(
     # JSON event lines so the reader sees actions and observations.
     with open(stdout_path, encoding="utf-8", errors="replace") as src:
         events = "".join(ln for ln in src if ln.startswith(EVENT_PREFIX))
-    trajectory = traj_dir / "trajectory.jsonl"
-    trajectory.write_text(events, encoding="utf-8")
+    # A transcript is the largest thing a rollout keeps, and it is kept for
+    # audit rather than for reading -- so it is stored compressed.
+    trajectory = traj_dir / "trajectory.jsonl.gz"
+    trajectory.write_bytes(compress_text(events))
 
     return GeneralRollout(
         worktree=workspace,

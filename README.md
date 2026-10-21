@@ -168,6 +168,32 @@ harness's `LongTermMEMORY.md` component.
 The same thing is available to any MCP client as the `harness2_recursion`
 tool.
 
+### Keeping the memory bounded
+
+The harness keeps three kinds of memory under `<workspace>/.harness2/`: the
+run artifacts (transcripts and evidence trees), the SQLite record
+(sessions, rollouts, facts, lessons), and the experience library (one entry
+per task). The first grows fastest — an evidence tree is copied again by the
+selection and reflection stages — so it is the one that needs a policy.
+
+Transcripts are stored compressed, the record's large fields are
+compressed, library entries a newer entry supersedes are retired, and a
+retention policy keeps the recent runs in full while older runs keep their
+conclusions and lose their transcripts. The policy runs at the end of every
+general run, and can be inspected or applied directly:
+
+```bash
+# through MCP, from any agent
+harness2_memory_status(workspace="<repo>", prune=true)
+```
+
+**[docs/FINDINGS.md](docs/FINDINGS.md)** records every bottleneck this
+harness hit — the disk blow-up, the isolation escapes, the runtime
+mismatches — with the measurement that exposed it, the root cause, and what
+was done about it.
+**[docs/GENERAL_HARNESS_EXPERIMENTS.md](docs/GENERAL_HARNESS_EXPERIMENTS.md)**
+is the working log of the experiments that found them.
+
 ## Model Context Protocol (MCP) Integration
 
 Harness² includes an official **MCP Server** (`harness2-mcp`) that exposes recursive agent harnessing capabilities, domain experience library queries, benchmark diagnostics, and harness materialization to external coding agents (**Claude Code**, **OpenCode**, **Codex**, and **Antigravity**).

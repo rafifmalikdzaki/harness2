@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from ..core import tree
+from ..core.compress import read_text
 from ..core.memory_db import MemoryDB
 from ..core.spec import BenchPrompts, BenchSpec, ChannelSpec
 from ..substrate.base import Install, RunRequest
@@ -366,11 +367,9 @@ class GeneralTaskAdapter:
         (run_dir / "worktree_path.txt").write_text(str(wt_path), encoding="utf-8")
         if leaks:
             (run_dir / "leaks.txt").write_text("\n".join(leaks) + "\n", encoding="utf-8")
-        traj = wt_path / ".harness_traj" / "trajectory.jsonl"
+        traj = wt_path / ".harness_traj" / "trajectory.jsonl.gz"
         if traj.is_file():
-            (run_dir / "trajectory.jsonl").write_text(
-                traj.read_text(encoding="utf-8", errors="replace"), encoding="utf-8"
-            )
+            (run_dir / "trajectory.jsonl.gz").write_bytes(traj.read_bytes())
         return run_dir
 
     def _sandbox_readonly(self, worktree: Path) -> list[tuple[Path, Path]]:
@@ -523,11 +522,13 @@ class GeneralTaskAdapter:
 
     def trajectory(self, run_dir: Path, *, obs_trunc: int) -> str:
         """The solver's event stream, rendered in the shared grammar."""
-        traj = run_dir / "trajectory.jsonl"
-        if traj.is_file():
-            text = traj.read_text(encoding="utf-8", errors="replace").strip()
-            if text:
-                return text[: max(1, obs_trunc)]
+        for name in ("trajectory.jsonl.gz", "trajectory.jsonl"):
+            traj = run_dir / name
+            if traj.is_file():
+                text = read_text(traj).strip()
+                if text:
+                    return text[: max(1, obs_trunc)]
+                break
         diff = (run_dir / "diff.patch").read_text(encoding="utf-8", errors="replace")
         out = (run_dir / "test_output.txt").read_text(encoding="utf-8", errors="replace")
         return f"[DIFF]\n{diff}\n[VERIFICATION]\n{out}"

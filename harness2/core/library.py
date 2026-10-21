@@ -180,6 +180,57 @@ class Library:
         self.index.write_text("\n".join(rows), encoding="utf-8")
         return self.index
 
+    def compact(self, *, keep: int = 24) -> int:
+        """Retire entries that a newer one has superseded.
+
+        The library is append-only by construction: one entry per task, each
+        with its full harness tree. Over months of runs that is an
+        unbounded directory of near-duplicates, and a reader -- the improver
+        model, or a person -- has to wade through all of it to find the
+        entries that matter.
+
+        Two entries with the same *cue* are the same lesson found twice:
+        the later one is kept, because it is the one that has seen more
+        evidence, and the earlier one is retired. Entries with distinct
+        cues are all kept, up to ``keep``.
+
+        Returns the number of entries retired.
+        """
+        names = self.entries()
+        if len(names) <= 1:
+            return 0
+
+        # Entries are named by the task that produced them, so their names
+        # say nothing about when they were learned. The directory's mtime
+        # does.
+        def learned_at(name: str) -> float:
+            try:
+                return (self.dir / "harnesses" / name).stat().st_mtime
+            except OSError:
+                return 0.0
+
+        by_cue: dict[str, str] = {}
+        for name in sorted(names, key=learned_at):
+            ed = self.dir / "harnesses" / name
+            cue = (_field(ed / "EXPERIENCE.md", "cue") or "").strip().lower()
+            if not cue:
+                continue
+            by_cue[cue] = name  # the later one wins
+
+        survivors = list(by_cue.values())
+        if len(survivors) > keep:
+            survivors = survivors[-keep:]
+
+        retired = 0
+        for name in names:
+            if name in survivors:
+                continue
+            shutil.rmtree(self.entry_dir(name), ignore_errors=True)
+            retired += 1
+        if retired:
+            self.rebuild_index()
+        return retired
+
 
 def _inventory(surface: SurfaceSpec, tree: harness_tree.Tree) -> str:
     """A one-line census of the components actually in this harness."""

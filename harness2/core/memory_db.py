@@ -22,6 +22,47 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .compress import compress_text, decompress_text
+
+# The marker a compressed blob carries, so a reader knows how to read it
+# and an older plain row still works.
+_GZIP_PREFIX = "gz1:"
+
+
+
+def _blob(text: Optional[str]) -> Optional[str]:
+    """Store large text compressed, and marked so a reader knows.
+
+    The marker is a prefix rather than a separate column, so the schema
+    stays as it was and an older row -- stored plainly -- still reads.
+    """
+    if text is None:
+        return None
+    if not text:
+        return ""
+    return _GZIP_PREFIX + compress_text(text).hex()
+
+
+def _unblob(value: Optional[str]) -> Optional[str]:
+    """Read back what :func:`_blob` wrote, and what an older row holds."""
+    if value is None:
+        return None
+    if not value.startswith(_GZIP_PREFIX):
+        return value
+    try:
+        raw = bytes.fromhex(value[len(_GZIP_PREFIX) :])
+    except ValueError:
+        return value
+    return decompress_text(raw)
+
+
+def _unblob_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """A rollout row with its large fields back in plain text."""
+    for key in ("git_diff", "test_output"):
+        if key in row:
+            row[key] = _unblob(row[key])
+    return row
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -115,13 +156,19 @@ class MemoryDB:
         rollout_id = f"roll_{uuid.uuid4().hex[:12]}"
         now = _now_iso()
         passed_val = None if test_passed is None else (1 if test_passed else 0)
+        # A diff and a verifier log are large, and the same bytes are
+        # already on disk in the run directory. The record keeps a pointer
+        # to where the full text lives and a compressed copy for the
+        # queries that want it without touching the filesystem.
+        diff_blob = _blob(git_diff)
+        out_blob = _blob(test_output)
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO rollouts (rollout_id, session_id, label, worktree_path, git_diff, test_passed, test_output, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (rollout_id, session_id, label, worktree_path, git_diff, passed_val, test_output, now),
+                (rollout_id, session_id, label, worktree_path, diff_blob, passed_val, out_blob, now),
             )
         return rollout_id
 
@@ -172,7 +219,9 @@ class MemoryDB:
                 return None
             sess = dict(row)
             rollouts = conn.execute("SELECT * FROM rollouts WHERE session_id = ?", (session_id,)).fetchall()
-            sess["rollouts"] = [dict(r) for r in rollouts]
+            # The blobs are compressed on the way in; a reader wants the
+            # text, not the encoding.
+            sess["rollouts"] = [_unblob_row(dict(r)) for r in rollouts]
             return sess
 
     def get_active_worktrees(self, session_id: str) -> List[Dict[str, Any]]:

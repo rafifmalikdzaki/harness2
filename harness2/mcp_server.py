@@ -569,6 +569,79 @@ def harness2_recursion(
     }
 
 
+
+@server.tool()
+def harness2_memory_status(
+    workspace: str,
+    prune: bool = False,
+    keep_evidence_runs: int = 3,
+    keep_transcript_runs: int = 10,
+    keep_runs: int = 50,
+) -> Dict[str, Any]:
+    """Report, and optionally prune, the harness's memory for a workspace.
+
+    The harness keeps three kinds of memory under `<workspace>/.harness2/`:
+    the run artifacts (transcripts and evidence trees), the SQLite record
+    (sessions, rollouts, facts, lessons), and the experience library (one
+    entry per task). The first grows fastest -- an evidence tree is copied
+    again by the selection and reflection stages -- so it is the one that
+    needs a policy.
+
+    With prune=false this only reports. With prune=true it applies the
+    retention policy: the recent runs keep their evidence and their
+    transcripts, older runs keep their conclusions and lose the rest, and
+    library entries a newer entry supersedes are retired.
+
+    Args:
+        workspace: The repository the harness has been working in.
+        prune: Apply the policy rather than only reporting.
+        keep_evidence_runs: How many recent runs keep their evidence trees.
+        keep_transcript_runs: How many recent runs keep their transcripts.
+        keep_runs: How many runs are kept at all.
+    """
+    ws = Path(workspace).expanduser().resolve()
+    harness_dir = ws / ".harness2"
+    if not harness_dir.is_dir():
+        return {"status": "error", "message": f"{harness_dir} does not exist."}
+
+    from harness2.core.retention import RetentionPolicy, prune_runs
+
+    runs_root = harness_dir / "runs"
+    policy = RetentionPolicy(
+        keep_evidence_runs=keep_evidence_runs,
+        keep_transcript_runs=keep_transcript_runs,
+        keep_runs=keep_runs,
+    )
+
+    def size_of(path: Path) -> int:
+        if not path.exists():
+            return 0
+        return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+
+    before = {
+        "runs": size_of(runs_root),
+        "library": size_of(harness_dir / "library"),
+        "database": size_of(harness_dir / "memory.db"),
+    }
+    pruned: Dict[str, int] = {}
+    if prune:
+        pruned = prune_runs(runs_root, policy)
+    after = {
+        "runs": size_of(runs_root),
+        "library": size_of(harness_dir / "library"),
+        "database": size_of(harness_dir / "memory.db"),
+    }
+    return {
+        "status": "ok",
+        "workspace": str(ws),
+        "policy": policy.describe(),
+        "before_bytes": before,
+        "after_bytes": after,
+        "pruned": pruned,
+        "saved_bytes": sum(before.values()) - sum(after.values()),
+    }
+
+
 @server.tool()
 def harness2_benchmark_status(
     bench: str = "jb",

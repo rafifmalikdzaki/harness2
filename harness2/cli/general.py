@@ -41,8 +41,30 @@ from pathlib import Path
 from .. import config
 from ..adapters.general import GeneralTaskAdapter
 from ..core.proposer import Proposer
+from ..core.retention import prune_runs
 from ..core.schedule import mode_token, run_domain
 from ..core.spec import resolve_channel_model
+
+
+def _compact_library(library_root: Path, adapter, modes) -> int:
+    """Retire the library entries a newer one supersedes.
+
+    The scheduler keeps one library per mode, under ``<root>/<mode>``.
+    """
+    retired = 0
+    for mode in modes:
+        try:
+            from ..core.library import Library
+
+            lib = Library(
+                root=Path(library_root) / mode,
+                domain=adapter.domain,
+                surface=adapter.substrate.surface(),
+            )
+            retired += lib.compact()
+        except Exception:
+            continue
+    return retired
 
 
 def main(argv=None) -> int:
@@ -135,12 +157,22 @@ def main(argv=None) -> int:
     report = adapter.harness_dir / f"general_{args.mode}_k{args.k}.json"
     report.write_text(json.dumps(result, indent=2, default=str) + "\n", encoding="utf-8")
 
+    # Keep the memory bounded. The run has produced its conclusions -- the
+    # library entry and the memory record -- so the transcripts and the
+    # evidence trees of older runs can go.
+    pruned = prune_runs(adapter.spec.runs_root)
+    retired = _compact_library(library_root, adapter, modes)
+
     print(f"General harness: {result['done']} done, {result['failed']} failed.")
     print(f"  runs    : {adapter.spec.runs_root}")
     print(f"  library : {library_root}")
     print(f"  report  : {report}")
     for row in result["tasks"]:
         print(f"  - {row['task']}: {row['status']}")
+    if any(pruned.values()):
+        print(f"  pruned  : {pruned}")
+    if retired:
+        print(f"  library: retired {retired} superseded entries")
     return int(result["failed"] > 0)
 
 
