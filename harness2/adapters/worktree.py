@@ -70,8 +70,8 @@ class WorktreeManager:
         if dest.exists():
             self.remove(session_id, label, force=True)
 
-        # Create branch and worktree
-        _run_git(["worktree", "add", "-b", branch, str(dest), "HEAD"], cwd=self.repo_root)
+        # Create detached worktree directly from HEAD (avoids polluting git branch list)
+        _run_git(["worktree", "add", "--detach", str(dest), "HEAD"], cwd=self.repo_root)
         return dest
 
     def get_diff(
