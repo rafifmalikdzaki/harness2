@@ -29,6 +29,34 @@ def test_the_workspace_is_writable(tmp_path):
     assert pairs(argv).get(str(tmp_path)) == "--bind"
 
 
+def test_extra_readonly_mount_under_workspace_follows_writable_mount(tmp_path):
+    """A worktree's venv is mounted read-only inside the writable worktree."""
+    source = tmp_path / "project-venv"
+    target = tmp_path / "worktree" / ".venv"
+    source.mkdir()
+    target.parent.mkdir()
+    workspace = target.parent
+    argv = sandbox_argv(workspace, extra_readonly=[(source, target)])
+    ro_index = next(
+        i for i, arg in enumerate(argv)
+        if arg == "--ro-bind" and argv[i + 1] == str(source.resolve())
+    )
+    rw_index = next(
+        i for i, arg in enumerate(argv)
+        if arg == "--bind" and argv[i + 1] == str(workspace.resolve())
+    )
+    assert ro_index > rw_index
+    assert argv[ro_index + 2] == str(target)
+
+
+def test_verifier_sandbox_can_hide_opencode_credentials(tmp_path):
+    """A test command needs the project venv, not the model credential DB."""
+    state = Path.home() / ".local" / "share" / "opencode"
+    argv = sandbox_argv(tmp_path, include_opencode_state=False)
+    if state.is_dir():
+        assert str(state) not in pairs(argv)
+
+
 def test_the_workspace_is_the_working_directory(tmp_path):
     argv = sandbox_argv(tmp_path)
     assert "--chdir" in argv
@@ -95,3 +123,24 @@ def test_the_environment_keeps_home_but_adds_a_path(tmp_path):
     env = sandbox_env(tmp_path)
     assert env["HOME"] == str(Path.home())
     assert "PATH" in env
+
+
+def test_the_environment_does_not_pass_host_credentials_to_shell_tools(tmp_path):
+    env = sandbox_env(
+        tmp_path,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "OPENAI_API_KEY": "do-not-expose",
+            "AWS_SECRET_ACCESS_KEY": "do-not-expose",
+            "GITHUB_TOKEN": "do-not-expose",
+            "MISTRAL_API_KEY": "do-not-expose",
+            "WANDB_MODE": "offline",
+            "CUDA_VISIBLE_DEVICES": "0",
+            "OPENCODE_CONFIG_CONTENT": '{"mcp":{"servers":{}}}',
+        },
+    )
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["WANDB_MODE"] == "offline"
+    assert env["CUDA_VISIBLE_DEVICES"] == "0"
+    assert env["OPENCODE_CONFIG_CONTENT"] == '{"mcp":{"servers":{}}}'
+    assert not any("KEY" in key or "TOKEN" in key or "SECRET" in key for key in env)

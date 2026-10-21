@@ -31,6 +31,7 @@ model provider.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Sequence
@@ -100,6 +101,7 @@ def sandbox_argv(
     home: Path | None = None,
     executable: str | Path | None = None,
     extra_readonly: Sequence[tuple[Path, Path]] = (),
+    include_opencode_state: bool = True,
 ) -> list[str]:
     """The ``bwrap`` prefix that confines a run to ``workspace``.
 
@@ -132,8 +134,9 @@ def sandbox_argv(
     argv += ["--tmpfs", "/tmp"]
     # The operator's home does not exist inside the sandbox.
     argv += ["--tmpfs", str(home_dir)]
-    for state in sandbox_state_dirs(executable):
-        argv += ["--bind", str(state), str(state)]
+    if include_opencode_state:
+        for state in sandbox_state_dirs(executable):
+            argv += ["--bind", str(state), str(state)]
     before: list[tuple[Path, Path]] = []
     after: list[tuple[Path, Path]] = []
     for source, target in extra_readonly:
@@ -173,7 +176,43 @@ def sandbox_env(
     explicitly. Nothing else about the home is reachable.
     """
     home_dir = Path(home or Path.home()).resolve()
-    out = dict(env if env is not None else os.environ)
+    source = env if env is not None else os.environ
+    # Tools launched by the model inherit the OpenCode process environment.
+    # Passing os.environ through would expose provider/API keys to arbitrary
+    # shell code even though the home directory is hidden. Keep only the
+    # environment needed to run OpenCode and the project's tests. Provider
+    # credentials are read by OpenCode from its mounted credential database.
+    allowed = {
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "NO_COLOR",
+        "CI",
+        "HOME",
+        "TMPDIR",
+        "OPENCODE_CONFIG_CONTENT",
+        "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX",
+        "CUDA_VISIBLE_DEVICES",
+        "CUDA_DEVICE_ORDER",
+        "CUDA_HOME",
+        "LD_LIBRARY_PATH",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "PYTHONUNBUFFERED",
+        "WANDB_MODE",
+        "WANDB_PROJECT",
+        "WANDB_ENTITY",
+        "WANDB_NAME",
+    }
+    secret_name = re.compile(r"(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)", re.I)
+    out = {
+        key: value
+        for key, value in source.items()
+        if key in allowed and not secret_name.search(key)
+    }
     out["HOME"] = str(home_dir)
     out.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
     return out

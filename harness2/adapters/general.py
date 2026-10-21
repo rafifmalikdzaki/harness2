@@ -28,7 +28,7 @@ from ..core.spec import BenchPrompts, BenchSpec, ChannelSpec
 from ..substrate.base import Install, RunRequest
 from ..substrate.opencode import OpencodeSubstrate
 from .general_runner import run_opencode_in_workspace, stage_harness
-from .sandbox import sandbox_available
+from .sandbox import sandbox_argv, sandbox_available, sandbox_env
 from .worktree import WorktreeManager
 
 __all__ = ["GeneralTaskAdapter"]
@@ -326,14 +326,33 @@ class GeneralTaskAdapter:
         test_output = ""
         if self.verify_cmd:
             try:
-                proc = subprocess.run(
-                    self.verify_cmd,
-                    cwd=wt_path,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=min(wall, 300),
-                )
+                if self.sandbox:
+                    # Verify in the same filesystem view as the rollout.
+                    # In particular, the project's venv is mounted at
+                    # worktree/.venv only inside bwrap; running pytest on the
+                    # host would see an empty mountpoint and falsely fail.
+                    cmd = sandbox_argv(
+                        wt_path,
+                        extra_readonly=self._sandbox_readonly(wt_path),
+                        include_opencode_state=False,
+                    ) + ["/bin/sh", "-c", self.verify_cmd]
+                    proc = subprocess.run(
+                        cmd,
+                        cwd=wt_path,
+                        env=sandbox_env(wt_path),
+                        capture_output=True,
+                        text=True,
+                        timeout=min(wall, 300),
+                    )
+                else:
+                    proc = subprocess.run(
+                        self.verify_cmd,
+                        cwd=wt_path,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=min(wall, 300),
+                    )
                 test_passed = proc.returncode == 0
                 test_output = (proc.stdout + "\n" + proc.stderr).strip()
             except Exception as e:
@@ -390,7 +409,13 @@ class GeneralTaskAdapter:
         venv = self.repo_root / ".venv"
         if not venv.is_dir():
             return pairs
-        pairs.append((venv, worktree / ".venv"))
+        # bwrap's target for --ro-bind must exist. A git worktree has no
+        # copy of the ignored virtualenv, so create an empty mountpoint; it
+        # is ignored by the repository and the source venv is only mounted
+        # over it inside the sandbox.
+        venv_target = worktree / ".venv"
+        venv_target.mkdir(parents=True, exist_ok=True)
+        pairs.append((venv, venv_target))
         for interpreter in self._interpreters(venv):
             if interpreter.is_dir() and interpreter not in {self.repo_root}:
                 pairs.append((interpreter, interpreter))

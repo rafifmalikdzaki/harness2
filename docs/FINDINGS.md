@@ -20,13 +20,13 @@ Status is one of:
 | area | findings | fixed | mitigated | open |
 |---|---|---|---|---|
 | A. The general path never ran | 6 | 6 | 0 | 0 |
-| B. Isolation | 8 | 5 | 3 | 0 |
-| C. Memory and disk | 6 | 2 | 4 | 0 |
+| B. Isolation | 10 | 7 | 3 | 0 |
+| C. Memory and disk | 6 | 5 | 1 | 0 |
 | D. The runtime | 6 | 6 | 0 | 0 |
-| E. Evidence and grading | 5 | 3 | 2 | 0 |
+| E. Evidence and grading | 5 | 5 | 0 | 0 |
 
-The two that mattered most were **F-21** (the evidence tree copied the
-repository, and then itself, until the disk was full) and **F-17** (the
+The two that mattered most were **F-17** (the evidence tree copied the
+repository, and then itself, until the disk was full) and **F-11** (the
 proposer was unsandboxed, so its relative writes landed in whatever
 directory the harness had been launched from).
 
@@ -274,6 +274,26 @@ runs as the operator.
 being bound in only where OpenCode needs it to make the model call.
 **Mitigated** — inside the sandbox the state directory is bound read-write
 because OpenCode writes its session database there.
+
+### F-33 — host credentials were still inherited through the environment
+
+**Measurement.** A sandboxed rollout could enumerate host environment
+variable names matching `KEY|TOKEN|SECRET|PASSWORD` and saw
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `MLFLOW_TRACKING_PASSWORD`,
+and `OPENAI_API_KEY`. Hiding the home directory did not hide values already
+copied into the process environment.
+
+**Root cause.** `sandbox_env` started by copying all of `os.environ` and
+overriding `HOME`. The shell tool inherits the OpenCode process environment,
+so a path sandbox alone did not protect env-injected credentials.
+
+**Solution.** Sandboxed processes now receive an allowlist of runtime-safe
+variables (PATH, locale, selected CUDA/thread/W&B settings, and the
+generated OpenCode config). Names containing `KEY`, `TOKEN`, `SECRET`,
+`PASSWORD`, `PASSWD`, `CREDENTIAL`, or `AUTH` are not passed. OpenCode
+authenticates from its mounted state database; a Mercury 3 model-call smoke
+test still passed after filtering. **Fixed** — `harness2/adapters/sandbox.py`,
+`tests/test_sandbox.py`.
 
 ---
 
