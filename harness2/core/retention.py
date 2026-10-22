@@ -150,18 +150,16 @@ def _prune_selection(root: Path) -> int:
     that. The candidates and the copied source are the bulk, and they go.
     """
     removed = 0
-    for d in root.rglob("selection"):
-        if not d.is_dir():
-            continue
-        for child in d.iterdir():
-            if child.name == "selection.json":
+    for record in root.rglob("selection.json"):
+        record_dir = record.parent
+        for child in record_dir.iterdir():
+            if child == record:
                 continue
             if child.is_dir():
                 shutil.rmtree(child, ignore_errors=True)
-                removed += 1
             else:
                 child.unlink(missing_ok=True)
-                removed += 1
+            removed += 1
     return removed
 
 
