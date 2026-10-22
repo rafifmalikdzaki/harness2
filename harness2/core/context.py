@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from . import tree as harness_tree
-from .spec import BenchmarkAdapter, RunView
+from .spec import GRADER_VERDICT_MARKERS, BenchmarkAdapter, RunView
 
 
 @dataclass
@@ -166,7 +166,16 @@ def build(
 
     assert_no_leak_paths(dest, adapter.spec.leak_globs)
 
-    assert_no_grader_verdicts(dest)
+    # The tripwire is scoped by the adapter: a benchmark declares the markers
+    # and aborts on a hit, because a leak there invalidates the measurement. A
+    # general task declares none and quarantines, because its evidence is the
+    # user's own repository and a marker in it is not a leak.
+    markers = getattr(adapter.spec, "grader_verdict_markers", GRADER_VERDICT_MARKERS)
+    policy = getattr(adapter.spec, "verdict_policy", "raise")
+    if policy == "quarantine":
+        quarantine_grader_verdicts(dest, markers)
+    else:
+        assert_no_grader_verdicts(dest, markers)
 
     if rollouts and not got_r:
         raise RuntimeError(
@@ -440,16 +449,6 @@ def assert_no_leak_paths(root: Path | str, patterns: Sequence[str]) -> None:
         raise ValueError(f"answer-key path(s) would enter model context: {shown}")
 
 
-GRADER_VERDICT_MARKERS: tuple[str, ...] = (
-    "deterministic_eval_summary",
-    "deterministic_eval_result",
-    "judge_scope_and_deterministic_status",
-    "Judge findings on the rendered result",
-    '"passed_count"',
-    '"pass_rate"',
-    '"test_pass_rate"',
-)
-
 _MARKER_SCAN_SUFFIXES = frozenset(
     {
         ".md",
@@ -488,28 +487,22 @@ def _markers_for(name: str, markers: Sequence[str]) -> Sequence[str]:
     return markers
 
 
-def assert_no_grader_verdicts(
+def scan_for_grader_verdicts(
     root: Path | str, markers: Sequence[str] = GRADER_VERDICT_MARKERS
-) -> None:
-    """Refuse a context tree containing the grader's own output, by file name and by content.
-
-    A tripwire on the adapters' read boundary, not the defence itself: if it fires, find the
-    read path that produced the match rather than widening the marker list.
-    """
+) -> list[tuple[str, str, str]]:
+    """Every (rel, marker, where) hit of the tripwire; an empty list when it is clean."""
     root = Path(root)
+    hits: list[tuple[str, str, str]] = []
     if not markers or not root.is_dir():
-        return
+        return hits
     for p in sorted(root.rglob("*")):
         if not p.is_file():
             continue
         rel = p.relative_to(root).as_posix()
         for m in markers:
             if m in rel:
-                raise ValueError(
-                    f"grader verdict would enter model context: {rel!r} matched marker {m!r} "
-                    f"in its NAME. The tripwire in core.context fired -- this is a leak, not "
-                    f"a false positive to widen around. Find the read path that produced it."
-                )
+                hits.append((rel, m, "its name"))
+                break
         if p.suffix.lower() not in _MARKER_SCAN_SUFFIXES:
             continue
         try:
@@ -519,12 +512,80 @@ def assert_no_grader_verdicts(
         for m in _markers_for(p.name, markers):
             if m in body:
                 where = body.index(m)
-                raise ValueError(
-                    f"grader verdict would enter model context: {rel!r} contains marker {m!r} "
-                    f"at offset {where} ({body[max(0, where - 60) : where + 120]!r}). The "
-                    f"tripwire in core.context fired -- this is a leak, not a false positive "
-                    f"to widen around. Find the read path that produced it."
-                )
+                hits.append((rel, m, f"offset {where}"))
+                break
+    return hits
+
+
+def assert_no_grader_verdicts(
+    root: Path | str, markers: Sequence[str] = GRADER_VERDICT_MARKERS
+) -> None:
+    """Refuse a context tree containing the grader's own output, by file name and by content.
+
+    A tripwire on the adapters' read boundary, not the defence itself: if it fires, find the
+    read path that produced the match rather than widening the marker list.
+    """
+    for rel, marker, where in scan_for_grader_verdicts(root, markers):
+        raise ValueError(
+            f"grader verdict would enter model context: {rel!r} matched marker {marker!r} "
+            f"in {where}. The tripwire in core.context fired -- this is a leak, not "
+            f"a false positive to widen around. Find the read path that produced it."
+        )
+
+
+def quarantine_grader_verdicts(
+    root: Path | str, markers: Sequence[str] = GRADER_VERDICT_MARKERS
+) -> list[str]:
+    """Move files that trip the wire out of the tree; return what was moved.
+
+    A tripwire that aborts the whole run is right for a benchmark, where a
+    leak invalidates the measurement. It is the wrong shape for a task whose
+    evidence IS the user's own repository: an ordinary script with a JSON key
+    like ``"passed_count"`` is not a leak, and refusing to run because of it
+    turns a false positive into a lost run.
+
+    So the file is moved aside, a warning says exactly what happened, and the
+    run continues without it.
+    """
+    root = Path(root)
+    hits = scan_for_grader_verdicts(root, markers)
+    if not hits:
+        return []
+    holding = root.parent / "quarantine"
+    moved: list[str] = []
+    for rel, marker, where in hits:
+        src = root / rel
+        if not src.is_file():
+            continue
+        dst = holding / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.move(str(src), str(dst))
+        except OSError:
+            continue
+        moved.append(rel)
+        holding.mkdir(parents=True, exist_ok=True)
+        note = holding / f"{rel}.quarantine.md"
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text(
+            f"# Quarantined: {rel}\n\n"
+            f"Matched the grader-verdict marker {marker!r} in {where}.\n"
+            f"Moved out of the evidence tree so it could not reach a model.\n",
+            encoding="utf-8",
+        )
+    if moved:
+        warnings = root / "WARNINGS.md"
+        lines = [
+            "# Warnings",
+            "",
+            "These files were held back from the evidence tree because they matched a "
+            "grader-verdict marker:",
+            "",
+        ]
+        lines += [f"- `{rel}`" for rel in moved]
+        lines += ["", "The run continued without them."]
+        warnings.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return moved
 
 
 def assert_tree_has_no_grader_verdicts(

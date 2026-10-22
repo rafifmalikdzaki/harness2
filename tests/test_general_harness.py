@@ -213,9 +213,17 @@ def test_mcp_recursion_reports_missing_models(tmp_path, monkeypatch):
     repo = make_repo(tmp_path)
     monkeypatch.setattr(config, "SOLVER_MODEL_OC", "")
     monkeypatch.setattr(config, "IMPROVER_MODEL", "")
+
+    # The default channel is `http`: the improver runs on the same model
+    # service as the solver, so a missing API key is what the user has to fix.
     out = harness2_recursion(goal="x", workspace=str(repo))
     assert out["status"] == "error"
-    assert "HARNESS2_SOLVER_MODEL" in out["message"]
+    assert "INCEPTION_API_KEY" in out["message"]
+
+    # On the opencode channel the improver needs its own provider-prefixed id.
+    out = harness2_recursion(goal="x", workspace=str(repo), channel="opencode")
+    assert out["status"] == "error"
+    assert "HARNESS2_IMPROVER_MODEL" in out["message"]
 
 
 # ---------------------------------------------------------------- evolution

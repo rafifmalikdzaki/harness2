@@ -245,6 +245,21 @@ def _evidence_block(
     return _assets_line(adapter, shown), a_evid
 
 
+def _apply_verdict_policy(root: Path, adapter: BenchmarkAdapter) -> None:
+    """The grader-verdict tripwire, as the adapter configures it.
+
+    A benchmark aborts on a hit, because a leak there invalidates the
+    measurement. A general task quarantines the file instead: its evidence is
+    the user's own repository, and the wire used to match ordinary code.
+    """
+    markers = getattr(adapter.spec, "grader_verdict_markers", context.GRADER_VERDICT_MARKERS)
+    policy = getattr(adapter.spec, "verdict_policy", "raise")
+    if policy == "quarantine":
+        context.quarantine_grader_verdicts(root, markers)
+    else:
+        context.assert_no_grader_verdicts(root, markers)
+
+
 def _fallback(sel: Selection, pool: dict[str, RunView], pool_kind: str, exc: Exception) -> bool:
     """The neutral stand-in after a selector failure: a delivered base, else the first final."""
     base = sorted(label for label in pool if _is_base(label))
@@ -259,6 +274,11 @@ def _fallback(sel: Selection, pool: dict[str, RunView], pool_kind: str, exc: Exc
         return False
     sel.chosen_id = next((a for a, label in sel.id_map.items() if label == sel.chosen_label), "")
     sel.fallback = True
+    # A fallback is NOT a win: `ok` stays False so the candidate is never
+    # judged as the method's result and no library entry is written from it.
+    # The `fallback` flag is what says a delivered candidate was picked
+    # anyway, and the caller reports that as a degraded run rather than a
+    # failed one.
     sel.error = str(exc)[:400]
     return True
 
@@ -338,7 +358,7 @@ def run_selection(
         ]
     )
 
-    context.assert_no_grader_verdicts(root)
+    _apply_verdict_policy(root, adapter)
 
     try:
         reply = prop.call(mission, root, f"select.{mode}{k}")
@@ -376,6 +396,27 @@ def run_selection(
 
     _persist(sel, root, str(pool[sel.chosen_label].run_dir if sel.chosen_label in pool else ""))
 
+    return sel
+
+
+def failed_selection(
+    task_id: str,
+    k: int,
+    mode: str,
+    candidates: dict[str, RunView],
+    *,
+    error: str,
+) -> Selection:
+    """A selection record for a run whose selector crashed.
+
+    The work is already done -- the rollouts ran and their artifacts are on
+    disk. This says so honestly: the selection did not happen, and no candidate
+    is claimed as the winner.
+    """
+    sel = Selection(task_id=task_id, mode=mode, k=k)
+    sel.n_candidates = len(candidates)
+    sel.ok = False
+    sel.error = error[:400]
     return sel
 
 
@@ -464,7 +505,7 @@ def reflect_adoption(
         encoding="utf-8",
     )
     context.assert_no_leak_paths(root, adapter.spec.leak_globs)
-    context.assert_no_grader_verdicts(root)
+    _apply_verdict_policy(root, adapter)
     experience = _distil(
         task_id, sel, candidates, adapter=adapter, prop=prop, root=root, layout=evidence.layout
     )
@@ -499,7 +540,7 @@ def _distil(
     exp_root = root.with_name(root.name + ".experience")
     shutil.rmtree(exp_root, ignore_errors=True)
     shutil.copytree(root, exp_root, ignore=shutil.ignore_patterns("selection.json"))
-    context.assert_no_grader_verdicts(exp_root)
+    _apply_verdict_policy(exp_root, adapter)
     try:
         reply = prop.call(mission, exp_root, f"experience.{sel.mode}{sel.k}")
     except ProposerError as exc:

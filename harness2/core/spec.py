@@ -32,6 +32,27 @@ ModelId = str
 
 CHANNELS = ("claude_cli", "opencode", "http")
 
+# Markers of a grader's own output. A benchmark's evidence must never carry
+# the grader's verdict: the model would be reading its own score.
+#
+# On a general task there IS no grader -- the verifier's output is the work's
+# own evidence and belongs in front of the model -- so the general adapter
+# declares no markers at all. The tripwire fired on ordinary repository code
+# (``"passed_count"`` is a normal JSON key) and aborted whole runs.
+GRADER_VERDICT_MARKERS: tuple[str, ...] = (
+    "deterministic_eval_summary",
+    "deterministic_eval_result",
+    "judge_scope_and_deterministic_status",
+    "Judge findings on the rendered result",
+    '"passed_count"',
+    '"pass_rate"',
+    '"test_pass_rate"',
+)
+
+# What to do when the tripwire fires: abort the run, or move the offending
+# file aside and continue with a warning.
+VERDICT_POLICIES = ("raise", "quarantine")
+
 
 @dataclass(frozen=True)
 class ChannelSpec:
@@ -147,6 +168,13 @@ class BenchSpec:
     leak_globs: tuple[str, ...] = ()
     allow_subagents: bool = False
 
+    # The grader-verdict tripwire. Benchmarks keep the full marker set and
+    # abort on a hit, because a leak there invalidates the measurement. A
+    # general task has no grader, so it declares no markers and quarantines
+    # rather than aborts.
+    grader_verdict_markers: tuple[str, ...] = GRADER_VERDICT_MARKERS
+    verdict_policy: str = "raise"
+
     reserved_scripts: frozenset[str] = frozenset()
     proposer_deliverables: str = "contents"
     state_deliverable: bool = False
@@ -156,6 +184,11 @@ class BenchSpec:
         if self.install_mode not in INSTALL_MODES:
             raise ValueError(
                 f"unknown install_mode {self.install_mode!r}; expected one of {INSTALL_MODES}"
+            )
+        if self.verdict_policy not in VERDICT_POLICIES:
+            raise ValueError(
+                f"verdict_policy must be one of {VERDICT_POLICIES}, got "
+                f"{self.verdict_policy!r}"
             )
         if self.proposer_deliverables not in ("contents", "names"):
             raise ValueError(
@@ -279,4 +312,6 @@ __all__ = [
     "resolve_channel_model",
     "CHANNELS",
     "INSTALL_MODES",
+    "GRADER_VERDICT_MARKERS",
+    "VERDICT_POLICIES",
 ]

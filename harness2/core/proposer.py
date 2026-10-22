@@ -57,11 +57,17 @@ _DROP_ENV = (
 
 
 # The `http` channel has no agent process behind it, so the contract with the
-# model is explicit: the harness files go in the prompt, the edits come back as
-# JSON, and this module applies them to the tree.
-_HTTP_SYSTEM = """You are the improver of an autonomous agent's harness.
+# model is explicit: the session's files go in the prompt, and what comes back
+# is applied or returned.
+#
+# There are two kinds of session. A PROPOSAL session edits the harness tree;
+# its answer is a set of file edits. An ANSWER session (the selector, the
+# lesson distiller) reads evidence and answers in the format its mission
+# specifies; its answer is text, and the format is the mission's own.
+_HTTP_SYSTEM_PROPOSE = """You are the improver of an autonomous agent's harness.
 
-You are given a MISSION and the CURRENT harness files. Reply with ONLY a JSON object:
+You are given a MISSION and the CURRENT harness files. The MISSION says what to change and
+why. Reply with ONLY a JSON object, no prose before or after it:
 
 {"notes": "<one short paragraph: what you changed and why, tracing each change to a moment in the evidence>",
  "edits": [{"path": "<path relative to the harness root>", "action": "write"|"delete", "content": "<the full new file content>"}]}
@@ -75,19 +81,37 @@ Rules:
 - Keep every change traceable to a moment in the evidence the MISSION points at.
 - If the harness should stay as it is, return an empty "edits" list and say why
   in "notes".
-- No prose outside the JSON object."""
+- Your reply is parsed by a program. Anything other than one JSON object is a failed reply."""
 
 
-def _http_prompt(mission: str, system: str, files: dict[str, str]) -> str:
-    """The user message for the http channel: mission, then the current tree."""
+_HTTP_SYSTEM_ANSWER = """You are executing one step of an agent-harness refinement.
+
+The MISSION below states exactly what to do and exactly what your reply must contain. Follow its
+OUTPUT FORMAT section literally: your reply is parsed by a program, so a ```choice``` block, a
+<why> block or an <experience> block that is missing, renamed or reformatted is a failed reply.
+
+Reply with the requested output only. No preamble, no commentary, no restating the mission."""
+
+
+def _session_kind(label: str) -> str:
+    """Whether a session proposes edits or answers in the mission's own format.
+
+    The label is the method's own convention: `select.<mode><k>` and
+    `experience.<mode><k>` are answer sessions, and a proposal session is
+    labelled after its stage (`inv1`, `dom2`, `agg1`, ...).
+    """
+    if label.startswith("select.") or label.startswith("experience."):
+        return "answer"
+    return "propose"
+
+
+def _http_propose_prompt(mission: str, system: str, files: dict[str, str]) -> str:
+    """The user message for a proposal session: mission, then the current tree."""
     parts = [f"# MISSION\n\n{mission}"]
     if system:
         parts.append(f"# ADDITIONAL INSTRUCTIONS\n\n{system}")
     if files:
-        rendered = []
-        for rel in sorted(files):
-            body = files[rel]
-            rendered.append(f'<file path="{rel}">\n{body}\n</file>')
+        rendered = [f'<file path="{rel}">\n{files[rel]}\n</file>' for rel in sorted(files)]
         parts.append(
             "# CURRENT HARNESS FILES\n\n"
             "These are the files you are editing. Emit an edit for each one you change.\n\n"
@@ -95,6 +119,21 @@ def _http_prompt(mission: str, system: str, files: dict[str, str]) -> str:
         )
     else:
         parts.append("# CURRENT HARNESS FILES\n\n(the harness is empty)")
+    return "\n\n".join(parts)
+
+
+def _http_answer_prompt(mission: str, system: str, files: dict[str, str]) -> str:
+    """The user message for an answer session: mission, then the evidence."""
+    parts = [f"# MISSION\n\n{mission}"]
+    if system:
+        parts.append(f"# ADDITIONAL INSTRUCTIONS\n\n{system}")
+    if files:
+        rendered = [f'<file path="{rel}">\n{files[rel]}\n</file>' for rel in sorted(files)]
+        parts.append(
+            "# THE EVIDENCE IS BELOW, INLINED\n\n"
+            "The mission refers to files on disk. Here they are, inline.\n\n"
+            + "\n\n".join(rendered)
+        )
     return "\n\n".join(parts)
 
 
@@ -207,7 +246,7 @@ class Proposer:
                 if context_dir and Path(context_dir).is_dir():
                     shutil.copytree(context_dir, tmp / "context", dirs_exist_ok=True)
                 with _SEM if _SEM is not None else contextlib.nullcontext():
-                    text, cost, err = self._dispatch(tmp, mission, system, wall)
+                    text, cost, err = self._dispatch(tmp, mission, system, wall, label)
                 spent_usd += cost
                 if not text.strip():
                     last = err or "empty reply"
@@ -254,32 +293,32 @@ class Proposer:
         )
 
     def _dispatch(
-        self, cwd: Path, mission: str, system: str, wall: int
+        self, cwd: Path, mission: str, system: str, wall: int, label: str = ""
     ) -> tuple[str, float, str]:
         """Run the session on this channel's backend."""
         if self.spec.kind == "claude_cli":
             return self._claude_cli(cwd, mission, system, wall)
         if self.spec.kind == "http":
-            return self._http(cwd, mission, system, wall)
+            return self._http(cwd, mission, system, wall, label)
         return self._opencode(cwd, mission, system, wall)
 
-    def _http(self, cwd: Path, mission: str, system: str, wall: int) -> tuple[str, float, str]:
-        """Propose harness edits over the plain HTTP chat client.
+    def _http(
+        self, cwd: Path, mission: str, system: str, wall: int, label: str
+    ) -> tuple[str, float, str]:
+        """Run one session over the plain HTTP chat client.
 
         No agent process runs here, so this channel owns the whole round trip: it
-        reads the harness tree out of the session directory, sends it with the
-        mission, and writes the model's edits back into the tree. Everything
-        downstream is unchanged -- the stage reads the tree back and validates it,
-        and an invalid tree is refused with the same feedback as any other channel.
+        reads the session's files out of the working directory, sends them with the
+        mission, and either applies the model's edits to the harness tree or
+        returns the model's answer verbatim. Everything downstream is unchanged --
+        a proposal is read back and validated like any other, and an answer is
+        parsed by the same regexes the CLI channels' answers are parsed by.
 
         Cost is reported as 0.0 because an OpenAI-compatible endpoint does not
         return a price. The token counts land in the audit trail instead, so a
         session on this channel is metered rather than priced.
         """
-        harness_dir = _find_harness_dir(cwd)
-        if harness_dir is None:
-            return "", 0.0, "no harness directory to edit"
-
+        kind = _session_kind(label)
         provider = llm.resolve_provider()
         if provider is None:
             return "", 0.0, (
@@ -287,36 +326,70 @@ class Proposer:
                 "HARNESS2_LLM_API_KEY and HARNESS2_LLM_MODEL) to use the http channel"
             )
 
-        files = _read_harness_files(harness_dir)
-        usage: dict = {}
-        try:
-            reply = llm.chat(
-                [
-                    {"role": "system", "content": _HTTP_SYSTEM},
-                    {"role": "user", "content": _http_prompt(mission, system, files)},
-                ],
-                temperature=0.4,
-                max_tokens=16000,
-                provider=provider,
-                timeout=max(30, min(int(wall), 900)),
-                usage=usage,
-            )
-        except llm.LLMError as exc:
-            return "", 0.0, str(exc)
-        self._last_usage = usage
+        if kind == "propose":
+            harness_dir = _find_harness_dir(cwd)
+            if harness_dir is None:
+                return "", 0.0, "no harness directory to edit"
+            files = _read_harness_files(harness_dir)
+            system_prompt = _HTTP_SYSTEM_PROPOSE
+            user = _http_propose_prompt(mission, system, files)
+        else:
+            harness_dir = None
+            files = _read_session_files(cwd)
+            system_prompt = _HTTP_SYSTEM_ANSWER
+            user = _http_answer_prompt(mission, system, files)
 
+        usage: dict = {}
+        reply = ""
+        last_err = ""
+        # A proposal that comes back as prose is the common failure, and a
+        # second attempt with the correction attached fixes it more often than
+        # the same request again.
+        for attempt in range(2):
+            try:
+                reply = llm.chat(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user},
+                    ],
+                    temperature=0.4 if kind == "propose" else 0.0,
+                    max_tokens=16000,
+                    provider=provider,
+                    timeout=max(30, min(int(wall), 900)),
+                    usage=usage,
+                )
+            except llm.LLMError as exc:
+                return "", 0.0, str(exc)
+            self._last_usage = usage
+            if kind == "answer":
+                if not reply.strip():
+                    last_err = "empty reply"
+                    continue
+                return reply, 0.0, ""
+            text, err = self._apply_proposal(harness_dir, reply)
+            if not err:
+                return text, 0.0, ""
+            last_err = err
+            user = (
+                f"{user}\n\n# CORRECTION\n\nYour previous reply was not usable: {err}\n\n"
+                f"Reply with ONE JSON object and nothing else."
+            )
+        return "", 0.0, last_err or "the model did not return a usable reply"
+
+    def _apply_proposal(self, harness_dir: Path | None, reply: str) -> tuple[str, str]:
+        """Apply a proposal's edits to the harness tree; return (reply text, error)."""
         try:
             data = llm.extract_json(reply)
         except (llm.LLMError, ValueError) as exc:
-            return "", 0.0, f"the proposal was not valid JSON: {exc}"
+            return "", f"the proposal was not valid JSON: {exc}"
         if not isinstance(data, dict):
-            return "", 0.0, f"the proposal was not a JSON object: {type(data).__name__}"
+            return "", f"the proposal was not a JSON object: {type(data).__name__}"
 
         edits = data.get("edits")
         if edits is None:
             edits = []
         if not isinstance(edits, list):
-            return "", 0.0, "'edits' was not a list"
+            return "", "'edits' was not a list"
 
         applied, refused = _apply_harness_edits(harness_dir, edits)
         notes = str(data.get("notes") or "").strip()
@@ -325,13 +398,12 @@ class Proposer:
         summary = {
             "edits_applied": applied,
             "edits_refused": refused,
-            "model": provider.model,
         }
         text = (
             f"<notes>\n{notes or '(no notes given)'}\n</notes>\n\n"
             f"```json\n{json.dumps(summary, indent=2)}\n```"
         )
-        return text, 0.0, ""
+        return text, ""
 
     def _claude_cli(
         self, cwd: Path, mission: str, system: str, wall: int
@@ -537,8 +609,40 @@ def _read_harness_files(harness_dir: Path) -> dict[str, str]:
     return out
 
 
+# An answer session's evidence is inlined into the prompt, because the model
+# has no filesystem of its own. The budget stops a session with a hundred
+# candidates from asking for a context window that does not exist.
+_SESSION_FILE_CHARS = 40_000
+_SESSION_TOTAL_CHARS = 400_000
+
+
+def _read_session_files(root: Path) -> dict[str, str]:
+    """The session's text files, as rel -> text, within a budget."""
+    out: dict[str, str] = {}
+    total = 0
+    for p in sorted(root.rglob("*")):
+        if not p.is_file() or "__pycache__" in p.parts or p.suffix == ".pyc":
+            continue
+        if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip", ".gz"):
+            continue
+        try:
+            body = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if not body.strip():
+            continue
+        clipped = body[:_SESSION_FILE_CHARS]
+        if len(body) > _SESSION_FILE_CHARS:
+            clipped += "\n\n(... truncated; read the file on disk for the rest ...)"
+        if total + len(clipped) > _SESSION_TOTAL_CHARS:
+            break
+        out[p.relative_to(root).as_posix()] = clipped
+        total += len(clipped)
+    return out
+
+
 def _apply_harness_edits(
-    harness_dir: Path, edits: list
+    harness_dir: Path | None, edits: list
 ) -> tuple[list[str], list[str]]:
     """Write the model's edits into the harness tree; return (applied, refused).
 
@@ -546,6 +650,8 @@ def _apply_harness_edits(
     one place a proposal can touch, and a proposal that reaches outside it has
     to be told no rather than obeyed.
     """
+    if harness_dir is None:
+        return [], ["(no harness directory to edit)"]
     root = harness_dir.resolve()
     applied: list[str] = []
     refused: list[str] = []

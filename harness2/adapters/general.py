@@ -29,13 +29,14 @@ from ..core.memory_db import MemoryDB
 from ..core.spec import BenchPrompts, BenchSpec, ChannelSpec
 from ..substrate.base import Install, RunRequest
 from ..substrate.opencode import OpencodeSubstrate
+from .diffguard import analyze_patch
 from .general_runner import run_opencode_in_workspace, stage_harness
 from .sandbox import sandbox_argv, sandbox_available, sandbox_env
 from . import agent
 from .. import llm
 from .worktree import WorktreeManager
 
-__all__ = ["GeneralTaskAdapter"]
+__all__ = ["GeneralTaskAdapter", "candidate_rows", "render_candidate_table"]
 
 
 # The source room the improver reads: the repository's tracked text files,
@@ -63,6 +64,77 @@ def _verdict_from_output(output: str) -> Optional[bool]:
     if head.startswith("VERIFICATION: FAILED"):
         return False
     return None
+
+
+def candidate_rows(runs_root: Path, session_id: str) -> List[Dict[str, object]]:
+    """One row per candidate of a run: what it did, how it was judged, what it cost."""
+    rows: List[Dict[str, object]] = []
+    base = Path(runs_root) / session_id
+    if not base.is_dir():
+        return rows
+    for d in sorted(base.iterdir()):
+        cj = d / "candidate.json"
+        if not cj.is_file():
+            continue
+        try:
+            rec = json.loads(cj.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        patch = d / "diff.patch"
+        stats = analyze_patch(patch.read_text(encoding="utf-8", errors="replace")) if patch.is_file() else None
+        review = rec.get("review") or {}
+        score = review.get("score")
+        harness = rec.get("harness") or {}
+        rows.append(
+            {
+                "label": d.name,
+                "strategy": rec.get("strategy", ""),
+                "verified": rec.get("test_passed"),
+                "critic": score,
+                "harness": harness.get("digest", ""),
+                "harness_applied": bool(harness.get("applied")),
+                "files": stats.files_changed if stats else 0,
+                "added": stats.bytes_added if stats else 0,
+                "removed": stats.bytes_removed if stats else 0,
+                "deleted": list(stats.deleted) if stats else [],
+                "errors": rec.get("errors") or [],
+            }
+        )
+    return rows
+
+
+def _short_label(label: str) -> str:
+    """The part of a run label that identifies the candidate.
+
+    Run labels carry the namespace and the session id, so the same candidate
+    name is repeated four times in a table that is supposed to compare them.
+    """
+    if "__" in label:
+        return label.rsplit("__", 1)[-1]
+    return label
+
+
+def render_candidate_table(rows: List[Dict[str, object]]) -> str:
+    """The run's candidates as a table: what each one did and how it was judged."""
+    if not rows:
+        return "(no candidates were produced)"
+    head = f"{'candidate':<14} {'strategy':<10} {'verify':<7} {'critic':<7} {'files':>5} {'+bytes':>9} {'-bytes':>9}"
+    lines = [head, "-" * len(head)]
+    for r in rows:
+        verified = r.get("verified")
+        verdict = "PASS" if verified is True else ("FAIL" if verified is False else "-")
+        critic = r.get("critic")
+        critic_s = f"{float(critic):.0f}/10" if isinstance(critic, (int, float)) else "-"
+        lines.append(
+            f"{_short_label(str(r.get('label','')))[:14]:<14} {str(r.get('strategy',''))[:10]:<10} "
+            f"{verdict:<7} {critic_s:<7} {int(r.get('files', 0)):>5} "
+            f"{int(r.get('added', 0)):>9,} {int(r.get('removed', 0)):>9,}"
+        )
+        for p in r.get("deleted") or []:
+            lines.append(f"{'':<14} deletes {p}")
+        for e in r.get("errors") or []:
+            lines.append(f"{'':<14} error: {str(e)[:100]}")
+    return "\n".join(lines)
 
 
 def _ensure_excluded(repo: Path, entry: str) -> None:
@@ -101,6 +173,7 @@ class GeneralTaskAdapter:
         timeout: int = 1800,
         allow_mcp: bool = False,
         sandbox: bool = True,
+        channel: str = "http",
     ):
         self.repo_root = Path(repo_root).expanduser().resolve()
         self.goal = goal.strip()
@@ -112,6 +185,11 @@ class GeneralTaskAdapter:
         # builds the selector's proposer from it, and a placeholder there
         # fails the selection session with "Model unavailable".
         self.selector_model = (selector_model or model).strip()
+        # The channel the improver and the selector run on. `http` uses the
+        # same model service as the solver, so one API key runs the whole loop;
+        # `opencode` goes through the OpenCode CLI and needs a provider-prefixed
+        # model id.
+        self.channel = channel if channel in ("http", "opencode") else "opencode"
         # The verification verdict per rollout label, recorded as it ran.
         self._verdicts: dict[str, bool] = {}
         self.timeout = int(timeout)
@@ -145,13 +223,21 @@ class GeneralTaskAdapter:
             if runs_root
             else self.harness_dir / "runs"
         )
-        channel = ChannelSpec("opencode", self.selector_model)
+        channel = ChannelSpec(self.channel, self.selector_model)
         self.spec = BenchSpec(
             name="general",
             runs_root=actual_runs_root,
             install_mode="workspace_agents_md",
             prompts=BenchPrompts(work=self.goal),
             channels={"proposer": channel, "selector": channel},
+            # There is no grader behind this path: the verification command's
+            # output IS the evidence, and the repository IS the material. The
+            # grader-verdict tripwire matched ordinary repository code (a
+            # `"passed_count"` JSON key is not a leak) and aborted whole runs,
+            # so this path declares no markers and quarantines rather than
+            # aborts.
+            grader_verdict_markers=(),
+            verdict_policy="quarantine",
         )
         self._ensure_base_harness()
 

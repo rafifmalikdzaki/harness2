@@ -16,11 +16,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from .compress import compress_text, decompress_text
 
@@ -77,14 +78,32 @@ class MemoryDB:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
+        # A generous busy timeout: rollouts run concurrently and each writes a
+        # row, so the default 5 seconds is a "database is locked" waiting to
+        # happen.
+        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
         return conn
 
+    @contextlib.contextmanager
+    def _tx(self) -> Iterator[sqlite3.Connection]:
+        """A connection that is CLOSED when the block ends.
+
+        `with conn:` is a transaction, not a closer. Every read used to leave
+        its connection open, and the WAL sidecar files with it.
+        """
+        conn = self._connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
     def _init_db(self) -> None:
-        with self._connect() as conn:
+        with self._tx() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -137,7 +156,7 @@ class MemoryDB:
     def start_session(self, goal: str, domain: str = "general") -> str:
         session_id = f"sess_{uuid.uuid4().hex[:12]}"
         now = _now_iso()
-        with self._connect() as conn:
+        with self._tx() as conn:
             conn.execute(
                 "INSERT INTO sessions (session_id, goal, domain, status, created_at) VALUES (?, ?, ?, ?, ?)",
                 (session_id, goal, domain, "active", now),
@@ -162,7 +181,7 @@ class MemoryDB:
         # queries that want it without touching the filesystem.
         diff_blob = _blob(git_diff)
         out_blob = _blob(test_output)
-        with self._connect() as conn:
+        with self._tx() as conn:
             conn.execute(
                 """
                 INSERT INTO rollouts (rollout_id, session_id, label, worktree_path, git_diff, test_passed, test_output, created_at)
@@ -180,7 +199,7 @@ class MemoryDB:
         evidence: Optional[str] = None,
     ) -> None:
         now = _now_iso()
-        with self._connect() as conn:
+        with self._tx() as conn:
             conn.execute(
                 """
                 INSERT INTO longterm_memory (category, fact, confidence, evidence, created_at, last_observed)
@@ -203,7 +222,7 @@ class MemoryDB:
         session_id: Optional[str] = None,
     ) -> None:
         now = _now_iso()
-        with self._connect() as conn:
+        with self._tx() as conn:
             conn.execute(
                 """
                 INSERT INTO lessons (session_id, domain, cue, lesson, evidence, confidence, created_at)
@@ -213,7 +232,7 @@ class MemoryDB:
             )
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._tx() as conn:
             row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
             if not row:
                 return None
@@ -225,7 +244,7 @@ class MemoryDB:
             return sess
 
     def get_active_worktrees(self, session_id: str) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 "SELECT rollout_id, label, worktree_path FROM rollouts WHERE session_id = ? AND worktree_path IS NOT NULL",
                 (session_id,),
@@ -239,14 +258,14 @@ class MemoryDB:
         best_rollout_id: Optional[str] = None,
     ) -> None:
         now = _now_iso()
-        with self._connect() as conn:
+        with self._tx() as conn:
             conn.execute(
                 "UPDATE sessions SET status = ?, best_rollout_id = ?, closed_at = ? WHERE session_id = ?",
                 (status, best_rollout_id, now, session_id),
             )
 
     def query_longterm_memory(self, category: Optional[str] = None) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._tx() as conn:
             if category:
                 rows = conn.execute(
                     "SELECT * FROM longterm_memory WHERE category = ? ORDER BY confidence DESC, last_observed DESC",

@@ -518,26 +518,40 @@ def _run_one_mode(
             task_id, k, mode, candidates, adapter=adapter, work_dir=work_dir
         )
     else:
-        sel = selection.run_selection(
-            task_id,
-            k,
-            mode,
-            candidates,
-            adapter=adapter,
-            prop=selector,
-            work_dir=work_dir,
-            pool_kind="finals",
-        )
+        try:
+            sel = selection.run_selection(
+                task_id,
+                k,
+                mode,
+                candidates,
+                adapter=adapter,
+                prop=selector,
+                work_dir=work_dir,
+                pool_kind="finals",
+            )
+        except Exception as exc:
+            # The rollouts are done and their artifacts are on disk. A selection
+            # that crashed is a degraded result, not a lost run: record it and
+            # keep everything that was produced.
+            sel = selection.failed_selection(
+                task_id, k, mode, candidates, error=f"{type(exc).__name__}: {exc}"
+            )
+            res.errors.append(f"{mode}: selection failed: {sel.error}")
     if mode_lib and sel.ok:
-        selection.reflect_adoption(
-            task_id,
-            sel,
-            r.rollouts,
-            adapter=adapter,
-            prop=selector,
-            work_dir=work_dir,
-            decisions={stage.label: stage.notes or stage.error for stage in r.stages},
-        )
+        try:
+            selection.reflect_adoption(
+                task_id,
+                sel,
+                r.rollouts,
+                adapter=adapter,
+                prop=selector,
+                work_dir=work_dir,
+                decisions={stage.label: stage.notes or stage.error for stage in r.stages},
+            )
+        except Exception as exc:
+            # The lesson is a bonus on top of a selection that already happened.
+            # Losing it must not lose the selection.
+            res.errors.append(f"{mode}: reflection failed: {type(exc).__name__}: {exc}")
     d = sel.to_dict()
     d["chosen_run_dir"] = str(
         candidates[sel.chosen_label].run_dir if sel.chosen_label in candidates else ""
@@ -550,7 +564,14 @@ def _run_one_mode(
         d["harness_fingerprint"] = runmark.fingerprint(work_dir / "harnesses" / sel.chosen_label)
     res.selections[mode] = d
     if not sel.ok:
-        res.errors.append(f"{mode}: selection failed: {sel.error}")
+        if sel.fallback:
+            res.errors.append(
+                f"{mode}: the selector failed, so the run fell back to the reference "
+                f"execution ({sel.chosen_label or 'none available'}). Nothing was "
+                f"selected on merit, so nothing here is a result: {sel.error}"
+            )
+        else:
+            res.errors.append(f"{mode}: selection failed: {sel.error}")
     chosen = candidates.get(sel.chosen_label)
     if sel.ok and chosen is not None and not chosen.delivered:
         res.errors.append(f"{mode}: selected run {chosen.run_id} produced no deliverable")

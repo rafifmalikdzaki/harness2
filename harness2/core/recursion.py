@@ -21,13 +21,14 @@ executions. Invalid proposals receive one retry before inheriting the current ha
 from __future__ import annotations
 
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
 from .. import config
-from . import context, prompts
+from . import context, progress, prompts
 from . import tree as harness_tree
 from .ledger import Ledger
 from .proposer import Proposer, ProposerError
@@ -126,7 +127,9 @@ def _accept_tree(
             reserved_scripts=harness_tree.RESERVED_SCRIPTS | adapter.spec.reserved_scripts,
         )
         adapter.validate_tree(new)
-        context.assert_tree_has_no_grader_verdicts(new)
+        context.assert_tree_has_no_grader_verdicts(
+            new, getattr(adapter.spec, "grader_verdict_markers", context.GRADER_VERDICT_MARKERS)
+        )
     except ValueError as exc:
         return kept, str(exc)
     return kept, ""
@@ -172,11 +175,11 @@ def _run_stage(
             error=f"could not build evidence: {type(exc).__name__}: {exc}"[:400],
             attempts=0,
         )
-
     err = ""
     spent_usd = 0.0
     spent_calls = 0
     all_cached = True
+    t0 = time.monotonic()
     for attempt in range(1, STAGE_ATTEMPTS + 1):
         try:
             reply = prop.call(
@@ -228,6 +231,15 @@ def _run_stage(
             harness_tree.write_tree(surface, new, tree.root / "harness")
             continue
         notes = re.search(r"<notes>(.*?)</notes>", reply.text, re.S)
+        progress.current().event(
+            "stage",
+            label=label,
+            dim=dim,
+            status="ok" if not kept else "kept-base",
+            wall_s=round(time.monotonic() - t0, 1),
+            usd=spent_usd,
+            attempts=spent_calls,
+        )
         return Stage(
             label=label,
             dim=dim,
@@ -239,6 +251,16 @@ def _run_stage(
             notes=notes.group(1).strip() if notes else reply.text.strip(),
         )
 
+    progress.current().event(
+        "stage",
+        label=label,
+        dim=dim,
+        status="fell-back",
+        wall_s=round(time.monotonic() - t0, 1),
+        usd=spent_usd,
+        attempts=spent_calls,
+        error=err[:200],
+    )
     return Stage(
         label=label,
         dim=dim,
@@ -275,6 +297,7 @@ def _roll(
             adapter.substrate.surface(), tree, work_dir / "harnesses" / label
         )
     run_id = run_id_of(label)
+    t0 = time.monotonic()
     try:
         rd = adapter.execute(task_id, hdir, run_id)
         exists = Path(rd).exists()
@@ -297,6 +320,13 @@ def _roll(
         )
     if record:
         ledger.rollout(label)
+    progress.current().event(
+        "rollout",
+        label=label,
+        status="delivered" if rv.delivered else ("ok" if rv.ok else "failed"),
+        wall_s=round(time.monotonic() - t0, 1),
+        error=rv.error,
+    )
     return rv
 
 
@@ -364,6 +394,8 @@ def run_parallel(
     ctx_dir = work_dir / "context"
     benchmark_prompts = resolve_prompts(adapter, task_id)
     base_dir = harness_tree.write_tree(surface, base_tree, work_dir / "harnesses" / "base")
+    progress.current().total_stages = 3 * k
+    progress.current().total_rollouts = 4 * k
 
     specs = [(f"{d.lower()}{i}", d, i) for i in range(1, k + 1) for d in ("INV", "DOM")]
     with ThreadPoolExecutor(max_workers=min(len(specs), propose_workers)) as pool_x:
@@ -472,6 +504,8 @@ def run_sequential(
     result.rollouts.update({r.label: r for r in base})
     ctx_dir = work_dir / "context"
     benchmark_prompts = resolve_prompts(adapter, task_id)
+    progress.current().total_stages = 3 * k
+    progress.current().total_rollouts = 4 * k
 
     current_harness = dict(base_tree)
     history: list[tuple[str, Path, RunView | None]] = []

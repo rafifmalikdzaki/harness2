@@ -76,7 +76,7 @@ def harness2_run_demo(
         "--mode",
         mode,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     report_file = out / "demo.json"
     result: Dict[str, Any] = {
         "status": "success" if proc.returncode == 0 else "failed",
@@ -86,8 +86,10 @@ def harness2_run_demo(
     if report_file.is_file():
         try:
             result["report"] = json.loads(report_file.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError) as exc:
+            # A torn report is worth saying out loud: a silent omission reads
+            # as "there was no report".
+            result["report_error"] = f"{type(exc).__name__}: {exc}"
     return result
 
 
@@ -439,11 +441,16 @@ def harness2_finish(
     rollout_label: Optional[str] = None,
     learned_facts: Optional[List[Dict[str, str]]] = None,
     keep_worktrees: bool = False,
+    allow_destructive: bool = False,
 ) -> Dict[str, Any]:
     """Accept (apply one candidate's diff to the working tree, unstaged-safe) or discard a session.
 
     Applies the recommended candidate from harness2_solve unless rollout_label overrides it,
     records learned facts, runs self-evolution, and deletes the session's worktrees/branches.
+
+    A candidate whose diff DELETES files is refused by default: applying it would remove
+    files from the repository, and a verification command that passed does not make that
+    safe. Re-run with allow_destructive=True to apply it anyway.
 
     Args:
         session_id: Session ID from harness2_solve.
@@ -452,6 +459,7 @@ def harness2_finish(
         rollout_label: Candidate label to apply instead of the recommendation.
         learned_facts: [{'category': ..., 'fact': ..., 'evidence': ...}] to store in memory.
         keep_worktrees: Keep worktrees for further inspection instead of deleting them.
+        allow_destructive: Apply a patch that deletes files.
     """
     ws = Path(workspace).expanduser().resolve()
     db = MemoryDB(ws / ".harness2" / "memory.db")
@@ -465,6 +473,7 @@ def harness2_finish(
 
     chosen = None
     applied = False
+    apply_result: Dict[str, Any] = {}
     evolution_result: Dict[str, Any] = {"status": "skipped"}
     if action == "accept":
         labels = [r["label"] for r in session.get("rollouts", [])]
@@ -479,10 +488,29 @@ def harness2_finish(
         if chosen not in labels:
             return {"status": "error", "message": f"Unknown rollout {chosen!r}; choose from {labels}."}
         try:
-            wt_mgr.apply_to_repo(session_id, chosen)
-            applied = True
+            apply_result = wt_mgr.apply_to_repo(
+                session_id, chosen, allow_destructive=allow_destructive
+            )
         except Exception as e:
             return {"status": "error", "message": f"Apply failed, nothing cleaned up: {e}"}
+        applied = bool(apply_result.get("applied"))
+        if not applied:
+            # Nothing was applied, so the session stays open and the worktrees
+            # stay where they are: the operator may want to look, or to apply
+            # with allow_destructive.
+            return {
+                "status": "not_applied",
+                "action": action,
+                "chosen_rollout": chosen,
+                "applied_to_repository": False,
+                "reason": apply_result.get("reason", "the candidate could not be applied"),
+                "stats": apply_result.get("stats", {}),
+                "worktrees_kept": True,
+                "next": (
+                    f"harness2_finish(session_id='{session_id}', workspace='{ws}', "
+                    f"rollout_label='{chosen}', allow_destructive=True) to apply it anyway"
+                ),
+            }
         for item in learned_facts or []:
             if item.get("category") and item.get("fact"):
                 db.add_longterm_fact(
@@ -499,6 +527,7 @@ def harness2_finish(
         "action": action,
         "chosen_rollout": chosen,
         "applied_to_repository": applied,
+        "applied_stats": apply_result.get("stats", {}),
         "deleted_worktrees": cleaned,
         "self_evolution": evolution_result,
         "note": "Changes are applied to the working tree only; review `git diff` and commit yourself.",
@@ -506,18 +535,41 @@ def harness2_finish(
 
 
 @server.tool()
-def harness2_config_status() -> Dict[str, Any]:
-    """Report which LLM provider/model the MCP server will use and whether it is reachable."""
+def harness2_config_status(probe: bool = False) -> Dict[str, Any]:
+    """Report which LLM provider/model the MCP server will use, and whether it is reachable.
+
+    The provider is resolved locally and reported without a model call. Pass
+    probe=True to spend one tiny call and confirm the endpoint answers -- a
+    status check that costs money and can block for three minutes is a status
+    check nobody runs.
+
+    Args:
+        probe: Make one live call to confirm the endpoint answers.
+    """
     from harness2 import llm
 
     p = llm.resolve_provider()
     if p is None:
-        return {"configured": False, "hint": "Set INCEPTION_API_KEY in harness2/.env"}
+        return {
+            "configured": False,
+            "hint": (
+                "Set INCEPTION_API_KEY in harness2/.env, or HARNESS2_LLM_BASE_URL, "
+                "HARNESS2_LLM_API_KEY and HARNESS2_LLM_MODEL"
+            ),
+            "probed": False,
+        }
+    out: Dict[str, Any] = {"configured": True, **p.public(), "probed": False}
+    if not probe:
+        return out
     try:
         reply = llm.chat([{"role": "user", "content": "Reply with: OK"}], max_tokens=512, retries=1)
-        return {"configured": True, **p.public(), "reachable": True, "sample": reply.strip()[:40]}
+        out["reachable"] = True
+        out["sample"] = reply.strip()[:40]
     except llm.LLMError as e:
-        return {"configured": True, **p.public(), "reachable": False, "error": str(e)[:400]}
+        out["reachable"] = False
+        out["error"] = str(e)[:400]
+    out["probed"] = True
+    return out
 
 
 @server.tool()
@@ -529,12 +581,16 @@ def harness2_list_sessions(workspace: str, status: Optional[str] = None) -> Dict
         return {"sessions": []}
     import sqlite3
 
-    con = sqlite3.connect(db_file)
-    con.row_factory = sqlite3.Row
-    q = "SELECT session_id, goal, domain, status, best_rollout_id, created_at, closed_at FROM sessions"
-    rows = con.execute(q + (" WHERE status=?" if status else "") + " ORDER BY created_at DESC",
-                       (status,) if status else ()).fetchall()
-    con.close()
+    con = sqlite3.connect(str(db_file), timeout=30.0)
+    try:
+        con.row_factory = sqlite3.Row
+        q = "SELECT session_id, goal, domain, status, best_rollout_id, created_at, closed_at FROM sessions"
+        rows = con.execute(
+            q + (" WHERE status=?" if status else "") + " ORDER BY created_at DESC",
+            (status,) if status else (),
+        ).fetchall()
+    finally:
+        con.close()
     return {"sessions": [dict(r) for r in rows]}
 
 
@@ -576,6 +632,8 @@ def harness2_recursion(
     timeout: int = 1800,
     allow_mcp: bool = False,
     sandbox: bool = True,
+    channel: str = "http",
+    improver_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the real Propose-Probe-Compose loop on a repository and goal.
 
@@ -606,6 +664,11 @@ def harness2_recursion(
         allow_mcp: Let the rollout use the MCP servers configured in your
             OpenCode. Off by default: they may hold credentials, and they are
             a route out of the workspace that a path fence does not close.
+        channel: 'http' (default) runs the improver and the selector on the
+            same model service as the solver, so one API key runs the whole
+            loop. 'opencode' runs them through the OpenCode CLI, which needs
+            HARNESS2_IMPROVER_MODEL set to a provider-prefixed id.
+        improver_model: Override the improver/selector model.
     """
     ws = Path(workspace).expanduser().resolve()
     if not (ws / ".git").exists():
@@ -614,38 +677,63 @@ def harness2_recursion(
         return {"status": "error", "message": "--k must be positive."}
     if mode not in ("parallel", "sequential"):
         return {"status": "error", "message": "mode must be 'parallel' or 'sequential'."}
+    if channel not in ("http", "opencode"):
+        return {"status": "error", "message": "channel must be 'http' or 'opencode'."}
 
-    from harness2 import config
+    from harness2 import config, llm
     from harness2.adapters.general import GeneralTaskAdapter
     from harness2.core.proposer import Proposer
     from harness2.core.schedule import mode_token, run_domain
     from harness2.core.spec import resolve_channel_model
 
+    try:
+        # The channel and the model are resolved INSIDE the try: a model id
+        # without a provider prefix used to raise out of the tool instead of
+        # coming back as an error the caller can act on.
+        if channel == "http":
+            channel_spec = resolve_channel_model("http", improver_model or None)
+        else:
+            model = (improver_model or config.IMPROVER_MODEL).strip()
+            if not model:
+                return {
+                    "status": "error",
+                    "message": (
+                        "no improver model: set HARNESS2_IMPROVER_MODEL, or use "
+                        "channel='http' to run the improver on the same endpoint as "
+                        "the solver"
+                    ),
+                }
+            channel_spec = resolve_channel_model("opencode", model)
+        proposer = Proposer(channel_spec)
+    except Exception as exc:
+        return {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
+
     solver_model = config.SOLVER_MODEL_OC.strip()
-    improver_model = config.IMPROVER_MODEL.strip()
-    if not solver_model or not improver_model:
+    if channel == "http" and llm.resolve_provider() is None:
         return {
             "status": "error",
             "message": (
-                "no models configured: set HARNESS2_SOLVER_MODEL and "
-                "HARNESS2_IMPROVER_MODEL (the opencode channel needs a "
-                "provider-prefixed id, e.g. anthropic/claude-sonnet-4-5)."
+                "no model service configured: set INCEPTION_API_KEY in harness2/.env, "
+                "or HARNESS2_LLM_BASE_URL, HARNESS2_LLM_API_KEY and HARNESS2_LLM_MODEL"
             ),
         }
 
     modes = (mode_token(mode),)
-    adapter = GeneralTaskAdapter(
-        repo_root=ws,
-        goal=goal,
-        domain=domain,
-        verify_cmd=verify_cmd,
-        model=solver_model,
-        selector_model=improver_model,
-        timeout=timeout,
-        allow_mcp=allow_mcp,
-        sandbox=sandbox,
-    )
-    proposer = Proposer(resolve_channel_model("opencode", improver_model))
+    try:
+        adapter = GeneralTaskAdapter(
+            repo_root=ws,
+            goal=goal,
+            domain=domain,
+            verify_cmd=verify_cmd,
+            model=solver_model,
+            selector_model=channel_spec.model,
+            channel=channel,
+            timeout=timeout,
+            allow_mcp=allow_mcp,
+            sandbox=sandbox,
+        )
+    except Exception as exc:
+        return {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
     library_root = adapter.harness_dir / "library" / f"k{k}"
 
     try:

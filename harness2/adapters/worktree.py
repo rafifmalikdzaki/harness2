@@ -26,6 +26,8 @@ import subprocess
 from pathlib import Path
 from typing import List, Optional, Sequence
 
+from .diffguard import analyze_patch, describe_destructive
+
 
 class WorktreeError(RuntimeError):
     """Raised when git worktree operations fail."""
@@ -167,8 +169,23 @@ class WorktreeManager:
         subprocess.run(["git", "worktree", "prune"], cwd=self.repo_root, capture_output=True)
         return cleaned
 
-    def apply_to_repo(self, session_id: str, label: str) -> None:
-        """Apply genuine code changes from the worktree into the primary repo working directory."""
+    def apply_to_repo(
+        self,
+        session_id: str,
+        label: str,
+        *,
+        allow_destructive: bool = False,
+    ) -> dict:
+        """Apply genuine code changes from the worktree into the primary repo working directory.
+
+        Returns what happened: ``{"applied": bool, "reason": str, "stats": {...}}``.
+        A refusal is a normal outcome, not an exception -- the operator decides
+        whether a patch that deletes files is one they want.
+
+        Every git step is checked. An unchecked `git add` makes an empty patch,
+        and an empty patch used to be reported as a successful apply: the
+        changes were silently lost and the caller was told they were applied.
+        """
         dest = self.worktree_dir(session_id, label)
         if not dest.is_dir():
             raise WorktreeError(f"Worktree directory {dest} does not exist.")
@@ -186,25 +203,63 @@ class WorktreeManager:
             ":(exclude)*.pyc",
             ":(exclude).pytest_cache",
         ]
-        subprocess.run(
+        add_res = subprocess.run(
             ["git", "add", "-A", "--", *exclude_args],
             cwd=dest,
             capture_output=True,
+            text=True,
         )
+        if add_res.returncode != 0:
+            raise WorktreeError(
+                "could not stage the candidate's changes:\n"
+                f"{(add_res.stderr or add_res.stdout or '').strip()}"
+            )
         patch_res = subprocess.run(
             ["git", "diff", "--cached", "HEAD", "--binary", "--", *exclude_args],
             cwd=dest,
             capture_output=True,
             text=True,
         )
-        patch = patch_res.stdout
-        if patch.strip():
-            apply_res = subprocess.run(
-                ["git", "apply", "--3way"],
-                cwd=self.repo_root,
-                input=patch,
-                capture_output=True,
-                text=True,
+        if patch_res.returncode != 0:
+            raise WorktreeError(
+                "could not read the candidate's changes:\n"
+                f"{(patch_res.stderr or patch_res.stdout or '').strip()}"
             )
-            if apply_res.returncode != 0:
-                raise WorktreeError(f"Failed to apply patch to repository:\n{apply_res.stderr}")
+        patch = patch_res.stdout
+        stats = analyze_patch(patch)
+
+        if not patch.strip():
+            return {
+                "applied": False,
+                "reason": "the candidate produced no changes to apply",
+                "stats": stats.to_dict(),
+                "patch_bytes": 0,
+            }
+
+        if stats.destructive and not allow_destructive:
+            return {
+                "applied": False,
+                "reason": (
+                    f"refused: {describe_destructive(stats)}. Applying it would remove "
+                    f"files from the repository. Re-run with allow_destructive to apply "
+                    f"it anyway."
+                ),
+                "stats": stats.to_dict(),
+                "patch_bytes": len(patch),
+            }
+
+        apply_res = subprocess.run(
+            ["git", "apply", "--3way"],
+            cwd=self.repo_root,
+            input=patch,
+            capture_output=True,
+            text=True,
+        )
+        if apply_res.returncode != 0:
+            raise WorktreeError(f"Failed to apply patch to repository:\n{apply_res.stderr}")
+        return {
+            "applied": True,
+            "reason": "",
+            "stats": stats.to_dict(),
+            "patch_bytes": len(patch),
+        }
