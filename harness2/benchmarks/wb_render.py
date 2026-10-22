@@ -324,13 +324,18 @@ def _bridge(payload: dict) -> dict:
             f"indistinguishable from a rollout that produced nothing, and it would silently "
             f"blank the evidence for the whole office subset."
         )
-    p = subprocess.run(
-        [bridge_py, os.path.abspath(__file__), "--bridge"],
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
+    try:
+        p = subprocess.run(
+            [bridge_py, os.path.abspath(__file__), "--bridge"],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RenderBackendError(
+            f"wb_render bridge ({bridge_py}) timed out after 1800s"
+        ) from exc
     if p.returncode != 0:
         raise RenderBackendError(
             f"wb_render bridge ({bridge_py}) failed: {p.stderr.strip()[-1200:]}"

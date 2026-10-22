@@ -83,7 +83,8 @@ def sandbox_state_dirs(executable: str | Path | None = None) -> list[Path]:
 
     Two of them: the directory the OpenCode binary is installed in, and the
     state directory where OpenCode keeps its credentials and its session
-    database. Both are read-write for the state, read-only for the binary.
+    database. The binary's directory is read-only and the state directory is
+    read-write; `sandbox_argv` binds them accordingly.
     """
     dirs: list[Path] = []
     if executable:
@@ -93,6 +94,21 @@ def sandbox_state_dirs(executable: str | Path | None = None) -> list[Path]:
     if _STATE_DIR.is_dir():
         dirs.append(_STATE_DIR)
     return dirs
+
+
+def sandbox_readonly_dirs(executable: str | Path | None = None) -> list[Path]:
+    """The directories a rollout may read but must not write.
+
+    The OpenCode binary's directory is one of them. Binding it read-write
+    would let a rollout overwrite the binary itself, and that change would
+    survive the sandbox and be executed by every later run.
+    """
+    out: list[Path] = []
+    if executable:
+        exe = Path(executable).resolve()
+        if exe.is_file():
+            out.append(exe.parent)
+    return out
 
 
 def sandbox_argv(
@@ -135,15 +151,25 @@ def sandbox_argv(
     # The operator's home does not exist inside the sandbox.
     argv += ["--tmpfs", str(home_dir)]
     if include_opencode_state:
-        for state in sandbox_state_dirs(executable):
-            argv += ["--bind", str(state), str(state)]
+        # The binary's directory is READ-ONLY: a rollout that could overwrite
+        # the binary would leave a change that outlives the sandbox and is
+        # executed by every later run.
+        for ro in sandbox_readonly_dirs(executable):
+            argv += ["--ro-bind", str(ro), str(ro)]
+        # The state directory is read-write: OpenCode writes there while it runs.
+        if _STATE_DIR.is_dir():
+            argv += ["--bind", str(_STATE_DIR), str(_STATE_DIR)]
     before: list[tuple[Path, Path]] = []
     after: list[tuple[Path, Path]] = []
     for source, target in extra_readonly:
         src = Path(source).resolve()
         if not src.is_dir():
             continue
-        dst = Path(target)
+        # The target is resolved too: it is compared against a resolved
+        # workspace, so a target with `..` in it was classified against the
+        # wrong path and could be mounted after the workspace bind, making
+        # part of the workspace read-only.
+        dst = Path(target).resolve()
         # A mount that *contains* the workspace has to come first, or it
         # would make the workspace read-only; a mount that *is inside* the
         # workspace has to come after, or the workspace's own mount would

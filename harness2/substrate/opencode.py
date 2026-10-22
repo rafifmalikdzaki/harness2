@@ -194,14 +194,24 @@ class OpenCodeCommand:
     kind: str  # "source" | "binary"
 
 
-def _permission_v1(workspace: Path) -> str:
-    """The V1 fence: deny every path outside the workspace."""
-    return json.dumps(
-        {"external_directory": {"*": "deny", str(workspace): "allow", f"{workspace}/**": "allow"}}
-    )
+def _permission_v1(workspace: Path, extra_allowed: Sequence[str] = ()) -> str:
+    """The V1 fence: deny every path outside the workspace.
+
+    `extra_allowed` names roots the rollout may also read: the project's own
+    checkout, for instance, when the rollout needs its virtualenv.
+    """
+    rules: dict[str, str] = {"*": "deny"}
+    for path in extra_allowed:
+        rules[str(path)] = "allow"
+        rules[f"{path}/**"] = "allow"
+    rules[str(workspace)] = "allow"
+    rules[f"{workspace}/**"] = "allow"
+    return json.dumps({"external_directory": rules})
 
 
-def _fence_v2(workspace: Path, *, allow_mcp: bool = False) -> str:
+def _fence_v2(
+    workspace: Path, *, allow_mcp: bool = False, extra_allowed: Sequence[str] = ()
+) -> str:
     """The V2 fence: the workspace boundary, plus the tools that cross it.
 
     A path fence is not a boundary on its own. Three things reach outside a
@@ -233,6 +243,11 @@ def _fence_v2(workspace: Path, *, allow_mcp: bool = False) -> str:
     permissions: list[dict[str, str]] = [
         {"action": "external_directory", "resource": "*", "effect": "deny"},
     ]
+    for path in extra_allowed:
+        permissions.append({"action": "external_directory", "resource": str(path), "effect": "allow"})
+        permissions.append(
+            {"action": "external_directory", "resource": f"{path}/**", "effect": "allow"}
+        )
     for tool in OPENCODE_OWN_TOOLS:
         permissions.append({"action": tool, "resource": "*", "effect": "deny"})
     if not allow_mcp:
@@ -256,6 +271,7 @@ def opencode_command(
     allow_mcp: bool = False,
     sandbox: bool = False,
     sandbox_readonly: Sequence[tuple[Path, Path]] = (),
+    extra_allowed: Sequence[str] = (),
 ) -> OpenCodeCommand:
     """Build the command for whichever OpenCode runtime is available.
 
@@ -274,6 +290,8 @@ def opencode_command(
     oc_dir = Path(opencode_dir or config.OPENCODE_DIR)
     env = dict(os.environ)
     env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] = str(int(OUTPUT_TOKEN_MAX))
+    resolved = ""
+    kind = "binary"
 
     if (oc_dir / "packages" / "opencode" / "src" / "index.ts").is_file():
         argv = [
@@ -300,55 +318,70 @@ def opencode_command(
             argv += ["--variant", variant]
         if session:
             argv += ["--session", session]
-        env["OPENCODE_PERMISSION"] = _permission_v1(workspace)
-        return OpenCodeCommand(argv=argv, cwd=oc_dir, env=env, kind="source")
-
-    exe = binary or os.environ.get("HARNESS2_OPENCODE_BIN") or "opencode"
-    resolved = shutil.which(exe)
-    if not resolved:
-        raise RuntimeError(
-            f"no OpenCode runtime: neither the pinned checkout at {oc_dir} "
-            "(run scripts/setup_benchmark.py) nor an `opencode` binary on PATH"
+        env["OPENCODE_PERMISSION"] = _permission_v1(workspace, extra_allowed)
+        # The V1 permission fence only covers `external_directory`. The V2
+        # document is what denies the inherited MCP servers, Code Mode and
+        # OpenCode's own worktree and session tools, so the source runtime
+        # gets it too.
+        env["OPENCODE_CONFIG_CONTENT"] = _fence_v2(
+            workspace, allow_mcp=allow_mcp, extra_allowed=extra_allowed
         )
-    cwd = Path(workspace)
-    argv = [
-        resolved,
-        "run",
-        # The installed build talks to a managed service on a fixed port; a
-        # private server per invocation avoids colliding with a running
-        # session (and with the other rollouts running alongside this one).
-        "--standalone",
-        "--format",
-        "json",
-        "--model",
-        model,
-        "--title",
-        title,
-        str(workspace),
-        prompt,
-    ]
-    if agent:
-        argv += ["--agent", agent]
-    if session:
-        argv += ["--session", session]
+        cwd = oc_dir
+        kind = "source"
+    else:
+        exe = binary or os.environ.get("HARNESS2_OPENCODE_BIN") or "opencode"
+        resolved = shutil.which(exe) or ""
+        if not resolved:
+            raise RuntimeError(
+                f"no OpenCode runtime: neither the pinned checkout at {oc_dir} "
+                "(run scripts/setup_benchmark.py) nor an `opencode` binary on PATH"
+            )
+        cwd = Path(workspace)
+        argv = [
+            resolved,
+            "run",
+            # The installed build talks to a managed service on a fixed port; a
+            # private server per invocation avoids colliding with a running
+            # session (and with the other rollouts running alongside this one).
+            "--standalone",
+            "--format",
+            "json",
+            "--model",
+            model,
+            "--title",
+            title,
+            str(workspace),
+            prompt,
+        ]
+        if agent:
+            argv += ["--agent", agent]
+        if session:
+            argv += ["--session", session]
 
-    # The fence. The pinned build took the proposer's reasoning effort as a
-    # model variant; V2 rejects both the variant and the effort for models
-    # that do not offer them, so neither is forced here. A caller that wants
-    # a named variant asks for it in the model id (provider/model#variant).
-    env["OPENCODE_CONFIG_CONTENT"] = _fence_v2(workspace, allow_mcp=allow_mcp)
+        # The fence. The pinned build took the proposer's reasoning effort as a
+        # model variant; V2 rejects both the variant and the effort for models
+        # that do not offer them, so neither is forced here. A caller that wants
+        # a named variant asks for it in the model id (provider/model#variant).
+        env["OPENCODE_CONFIG_CONTENT"] = _fence_v2(
+            workspace, allow_mcp=allow_mcp, extra_allowed=extra_allowed
+        )
 
+    # The sandbox wraps BOTH runtimes. It used to be applied only to the
+    # installed binary, so on a correctly-installed machine -- the pinned
+    # checkout is the default deployment -- the sandbox was inert: a shell
+    # command in the rollout had the operator's full privileges, and the
+    # operator's environment (API keys and all) reached it unfiltered.
     if sandbox:
         from ..adapters.sandbox import sandbox_argv, sandbox_env
 
         argv = sandbox_argv(
-            workspace, executable=resolved, extra_readonly=sandbox_readonly
+            workspace, executable=resolved or None, extra_readonly=sandbox_readonly
         ) + argv
         env = sandbox_env(workspace, env=env)
         # The sandboxed process starts in the workspace.
         cwd = Path(workspace)
 
-    return OpenCodeCommand(argv=argv, cwd=cwd, env=env, kind="binary")
+    return OpenCodeCommand(argv=argv, cwd=cwd, env=env, kind=kind)
 
 
 class OpencodeSubstrate:
@@ -507,7 +540,11 @@ _TRUNC_FMT = "…(+{n} chars — render truncation)"
 def _clip(s, n: int) -> str:
     s = "" if s is None else str(s)
     s = s.replace("\x00", "")
-    if n <= 0 or len(s) <= n:
+    if n <= 0:
+        # A budget of zero means NO text, not "no limit". Returning the whole
+        # string here meant an unbounded observation reached the model.
+        return ""
+    if len(s) <= n:
         return s
     return s[:n] + _TRUNC_FMT.format(n=len(s) - n)
 

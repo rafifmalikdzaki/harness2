@@ -104,6 +104,10 @@ def resolve_runtime(
         allow_mcp=allow_mcp,
         sandbox=sandbox,
         sandbox_readonly=sandbox_readonly,
+        # The roots the rollout may also read. The parameter used to be
+        # accepted here and dropped on the floor, so the fence denied paths
+        # the caller had explicitly opened.
+        extra_allowed=[str(p) for p in (extra_allowed or [])],
     )
     return OpenCodeRuntime(
         kind=command.kind,
@@ -142,6 +146,21 @@ def stage_harness(staged: Path, workspace: Path, ctx: dict) -> list[str]:
                 authored.append(str(p.relative_to(workspace)))
     shutil.rmtree(render_dir, ignore_errors=True)
     return authored
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Kill a timed-out rollout's whole process group, then reap it."""
+    import os
+    import signal
+
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:  # pragma: no cover - the group is gone
+        pass
 
 
 def run_opencode_in_workspace(
@@ -183,17 +202,23 @@ def run_opencode_in_workspace(
     with open(stdout_path, "w", encoding="utf-8") as out, open(
         stderr_path, "w", encoding="utf-8"
     ) as err:
+        # The process GROUP is killed on a timeout, not just the child. A
+        # rollout's shell commands are grandchildren: `subprocess.run(timeout=)`
+        # kills the direct child only, and the survivors kept writing into the
+        # worktree while the harness was verifying it and diffing it.
+        proc = subprocess.Popen(
+            runtime.argv,
+            cwd=runtime.cwd,
+            env=runtime.env,
+            stdout=out,
+            stderr=err,
+            start_new_session=True,
+        )
         try:
-            code = subprocess.run(
-                runtime.argv,
-                cwd=runtime.cwd,
-                env=runtime.env,
-                stdout=out,
-                stderr=err,
-                timeout=timeout,
-            ).returncode
+            code = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             err.write(f"\n[general] TIMEOUT after {timeout}s\n")
+            _kill_group(proc)
 
     # The trajectory is the event stream, not the raw stdout: keep only the
     # JSON event lines so the reader sees actions and observations.

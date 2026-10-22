@@ -32,7 +32,7 @@ from ..substrate.opencode import OpencodeSubstrate
 from . import agent
 from .diffguard import analyze_patch
 from .general_runner import run_opencode_in_workspace
-from .sandbox import sandbox_available
+from .sandbox import sandbox_argv, sandbox_available, sandbox_env
 from .worktree import WorktreeManager
 
 __all__ = [
@@ -153,6 +153,8 @@ def _verdict_from_output(output: str) -> Optional[bool]:
         return True
     if head.startswith("VERIFICATION: FAILED"):
         return False
+    if head.startswith("VERIFICATION: NOT RUN"):
+        return None
     return None
 
 
@@ -287,6 +289,8 @@ class GeneralTaskAdapter:
         # binary; the http runtime needs an API key and nothing else.
         self.runtime = runtime if runtime in ("http", "opencode") else "http"
         # The verification verdict per rollout label, recorded as it ran.
+        # A rollout whose solver never produced code has NO verdict: it is
+        # ungraded, not a failure.
         self._verdicts: dict[str, bool] = {}
         self.timeout = int(timeout)
         # A rollout does not inherit the operator's MCP servers by default:
@@ -609,13 +613,42 @@ class GeneralTaskAdapter:
         The exit status is the verdict. A timeout is not a failing test: it is
         the command not finishing, and it is recorded as its own thing so the
         reader is not told a test failed when nothing ran to completion.
+
+        The command runs INSIDE the sandbox when there is one. It executes the
+        agent's own code -- a conftest, a Makefile, a build script -- so
+        running it on the host hands the agent the operator's credentials and
+        the operator's write access to the rest of the machine.
         """
         if not self.verify_cmd:
             return None, "", None
+        argv = None
+        env = None
+        if self.sandbox and sandbox_available():
+            argv = sandbox_argv(
+                wt_path,
+                extra_readonly=self._sandbox_readonly(wt_path),
+                include_opencode_state=False,
+            ) + ["/bin/sh", "-c", self.verify_cmd]
+            env = sandbox_env(wt_path)
         try:
-            proc = subprocess.run(
-                self.verify_cmd, cwd=wt_path, shell=True, capture_output=True, text=True, timeout=timeout
-            )
+            if argv is not None:
+                proc = subprocess.run(
+                    argv,
+                    cwd=wt_path,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            else:
+                proc = subprocess.run(
+                    self.verify_cmd,
+                    cwd=wt_path,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
             return (
                 proc.returncode == 0,
                 (proc.stdout + "\n" + proc.stderr).strip(),
@@ -721,9 +754,16 @@ class GeneralTaskAdapter:
         # The verdict is the exit status of the verification command, recorded as
         # it ran. A judge that reads it later must see the same thing the rollout
         # saw, so it is written into the artifact and kept in memory.
-        self._verdicts[label] = bool(test_passed)
+        #
+        # Three states, not two: a command that never ran is not a failure, and
+        # recording it as one graded a candidate that produced no code as if it
+        # had produced the wrong code.
+        if test_passed is not None:
+            self._verdicts[label] = test_passed
         if self.verify_cmd is None:
             verdict_line = "VERIFICATION: no verification command was given"
+        elif test_passed is None:
+            verdict_line = "VERIFICATION: NOT RUN (the solver produced no code to verify)"
         elif test_passed:
             verdict_line = "VERIFICATION: PASSED (exit status 0)"
         elif verify_status is None:

@@ -81,8 +81,17 @@ def verification_strength(verify_cmd: Optional[str]) -> str:
 
 
 def _git_files(root: Path) -> List[str]:
-    out = subprocess.run(["git", "ls-files"], cwd=root, capture_output=True, text=True).stdout
-    return [f for f in out.splitlines() if f and not f.startswith((".harness2/", ".harness_staged/"))]
+    try:
+        res = subprocess.run(
+            ["git", "ls-files"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except Exception:
+        return []
+    return [f for f in res.stdout.splitlines() if f and not f.startswith((".harness2/", ".harness_staged/"))]
 
 
 def gather_context(root: Path, goal: str, extra_files: Optional[List[str]] = None) -> str:
@@ -109,33 +118,64 @@ def gather_context(root: Path, goal: str, extra_files: Optional[List[str]] = Non
             continue
         chunk = f"\n# File: {f}\n```\n{body}\n```\n"
         if len(chunk) > budget:
-            break
+            # This file does not fit. Later files may be smaller and more
+            # relevant, so they are still considered: `break` abandoned them.
+            continue
         parts.append(chunk)
         budget -= len(chunk)
     return "".join(parts)
 
 
 def _safe_target(root: Path, rel: str) -> Path:
+    """Where a model-supplied path may be written.
+
+    The containment check is on the RESOLVED path, so `..`, an absolute
+    path, and a symlink pointing outside the repository are all refused.
+    The `.git` check is on the resolved path too: a tracked symlink named
+    `x -> .git` made `x/config` resolve into the repository's real git
+    directory while the lexical path said nothing about `.git`.
+    """
+    root_resolved = root.resolve()
     p = (root / rel).resolve()
-    if root.resolve() not in p.parents or ".git" in Path(rel).parts:
+    if root_resolved not in p.parents:
+        raise ValueError(f"unsafe edit path: {rel!r}")
+    if ".git" in p.relative_to(root_resolved).parts:
         raise ValueError(f"unsafe edit path: {rel!r}")
     return p
 
 
 def apply_edits(root: Path, edits: List[Dict[str, Any]]) -> List[str]:
+    """Apply the model's edits inside the worktree; return the paths written.
+
+    One bad edit does not sink the candidate: an edit that names a directory,
+    or a path that escapes, is refused and the rest are applied. The refusal
+    used to raise an OSError the caller did not catch, and the whole
+    candidate was lost.
+    """
     touched: List[str] = []
     for e in edits:
         rel = str(e.get("path", "")).strip()
         if not rel:
             continue
-        target = _safe_target(root, rel)
-        if e.get("action") == "delete":
-            if target.is_file():
-                target.unlink()
-                touched.append(rel)
+        try:
+            target = _safe_target(root, rel)
+        except ValueError:
             continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(str(e.get("content", "")), encoding="utf-8")
+        if e.get("action") == "delete":
+            try:
+                if target.is_file():
+                    target.unlink()
+                    touched.append(rel)
+            except OSError:
+                continue
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(str(e.get("content", "")), encoding="utf-8")
+        except OSError:
+            # A directory where a file should be, a read-only path, a name
+            # the filesystem refuses: the edit is skipped, not fatal.
+            continue
         touched.append(rel)
     return touched
 

@@ -21,6 +21,7 @@ version still reads.
 from __future__ import annotations
 
 import gzip
+import zlib
 from pathlib import Path
 
 __all__ = [
@@ -73,7 +74,10 @@ def read_text(path: Path | str) -> str:
     if path.name.endswith(".gz"):
         try:
             return decompress_text(path.read_bytes())
-        except (OSError, EOFError, gzip.BadGzipFile):
+        except (OSError, EOFError, zlib.error):
+            # A gzip file with a valid header and a corrupt payload raises
+            # zlib.error, which is not an OSError: it used to escape and take
+            # the reader with it.
             return ""
     return path.read_text(encoding="utf-8", errors="replace")
 

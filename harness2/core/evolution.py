@@ -89,8 +89,8 @@ class SelfEvolutionEngine:
 
         # 1. Self-Evolution from Test Verifications & Contrasts
         if successful and failed:
-            succ_files = _changed_files(successful[0].get("git_diff", ""))
-            fail_files = _changed_files(failed[0].get("git_diff", ""))
+            succ_files = _changed_files(successful[0].get("git_diff") or "")
+            fail_files = _changed_files(failed[0].get("git_diff") or "")
             lesson_cue = f"When solving: {goal[:80]}"
             lesson_body = _contrast_lesson(
                 goal,
@@ -140,7 +140,7 @@ class SelfEvolutionEngine:
 
     def _extract_facts_from_context(self, goal: str, rollouts: List[Dict[str, Any]]) -> List[tuple]:
         facts = []
-        combined_text = goal + "\n" + "\n".join(r.get("test_output", "") for r in rollouts)
+        combined_text = goal + "\n" + "\n".join((r.get("test_output") or "") for r in rollouts)
         lower = combined_text.lower()
 
         # Pattern detection: frameworks & test runners
@@ -160,7 +160,7 @@ class SelfEvolutionEngine:
         touched: set[str] = set()
         for r in rollouts:
             if r.get("test_passed") == 1:
-                touched.update(_changed_files(r.get("git_diff", "")))
+                touched.update(_changed_files((r.get("git_diff") or "")))
         by_dir: dict[str, int] = {}
         for rel in touched:
             top = rel.split("/", 1)[0]
@@ -188,22 +188,26 @@ class SelfEvolutionEngine:
             clean_name = f"skill-{domain}"
 
         label = successful_rollouts[0].get("label", "probe")
-        files = _changed_files(successful_rollouts[0].get("git_diff", ""))
+        files = _changed_files(successful_rollouts[0].get("git_diff") or "")
         touched = ", ".join(f"`{f}`" for f in files[:8]) or "(no file changes recorded)"
         procedure = (
             "\n".join(f"{i}. Edit {rel}." for i, rel in enumerate(files[:8], 1))
             or "1. Edit the files the goal names."
         )
+        # The goal is free text and goes into YAML frontmatter. A newline in it
+        # injects another key, and the OpenCode surface drops a skill whose
+        # frontmatter name does not match its directory -- silently, at load.
+        safe_goal = " ".join(str(goal).split()).replace('"', "'")
         skill_content = f"""---
 name: {clean_name}
-description: Procedural skill synthesized from a verified resolution of: {goal}
+description: "Procedural skill synthesized from a verified resolution of: {safe_goal}"
 ---
 
 # Skill: {clean_name.replace('-', ' ').title()}
 
 ## Trigger Cue
 When working on tasks related to:
-> {goal}
+> {safe_goal}
 
 ## Verified Procedure
 The rollout `{label}` passed its verification command. It changed:

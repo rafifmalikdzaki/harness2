@@ -37,7 +37,14 @@ def check(adapter, *, judge=False) -> list[str]:
                 [str(c) for c in cmd], cwd=cwd, capture_output=True, text=True, timeout=45
             )
             if r.returncode:
-                errors.append(f"{label} failed; {remedy}")
+                # The subprocess's own error is the useful part. Discarding it
+                # made every dependency failure report the same sentence.
+                detail = (r.stderr or "").strip() or (r.stdout or "").strip()
+                errors.append(
+                    f"{label} failed (rc={r.returncode})"
+                    + (f": {detail[-300:]}" if detail else "")
+                    + f"; {remedy}"
+                )
             return r.returncode == 0
         except (OSError, subprocess.TimeoutExpired) as exc:
             errors.append(f"{label}: {type(exc).__name__}; see README.md")
@@ -68,6 +75,11 @@ def check(adapter, *, judge=False) -> list[str]:
                     errors.append(f"{dependency}: checkout differs from the supported pin")
             except subprocess.CalledProcessError:
                 errors.append(f"{dependency}: cannot read checkout revision")
+            except OSError as exc:
+                # `git` not on PATH raises FileNotFoundError, which is an
+                # OSError, not a CalledProcessError -- and it used to escape
+                # the whole check.
+                errors.append(f"{dependency}: cannot run git: {exc}")
         patch = config.THIRD_PARTY / "patches" / PATCHES[dependency]
         probe(
             f"{dependency} patch",

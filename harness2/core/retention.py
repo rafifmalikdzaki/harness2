@@ -99,12 +99,18 @@ def _run_dirs(runs_root: Path) -> list[Path]:
 
 
 def _prune_tree(root: Path, names: tuple[str, ...]) -> int:
-    """Remove the named subdirectories wherever they appear under root."""
+    """Remove the named subdirectories and files wherever they appear under root."""
     removed = 0
     for name in names:
         for p in root.rglob(name):
             if p.is_dir():
                 shutil.rmtree(p, ignore_errors=True)
+                removed += 1
+            elif p.is_file():
+                # The transcripts are FILES. Removing only directories meant the
+                # largest per-run artefact was never pruned, and the policy
+                # reported that it had.
+                p.unlink(missing_ok=True)
                 removed += 1
     return removed
 

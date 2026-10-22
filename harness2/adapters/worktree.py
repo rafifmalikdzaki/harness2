@@ -33,9 +33,14 @@ class WorktreeError(RuntimeError):
     """Raised when git worktree operations fail."""
 
 
+# A git call with no timeout hangs the run forever: one lock file, one
+# credential prompt, one huge index is enough.
+_GIT_TIMEOUT = 120
+
+
 def _run_git(args: List[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     cmd = ["git", *args]
-    res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=_GIT_TIMEOUT)
     if res.returncode != 0:
         raise WorktreeError(f"Git command failed: {' '.join(cmd)}\nError: {res.stderr.strip()}")
     return res
@@ -148,17 +153,34 @@ class WorktreeManager:
             if rel:
                 pathspec.append(f":(exclude){rel}")
 
+        # `git diff HEAD` never shows a file the agent CREATED. The selector
+        # read a diff that said "?? newpkg/" and nothing else -- no file name,
+        # no content -- while the apply produced the real thing. The two
+        # disagreed about what the candidate did.
+        #
+        # `git add -N` records the path WITHOUT its content, so the diff then
+        # shows the new files as additions, and the untracked section is left
+        # with only what could not be recorded.
+        subprocess.run(
+            ["git", "add", "-N", "--", *pathspec],
+            cwd=dest,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT,
+        )
         diff_res = subprocess.run(
             ["git", "diff", "HEAD", "--", *pathspec],
             cwd=dest,
             capture_output=True,
             text=True,
+            timeout=_GIT_TIMEOUT,
         )
         untracked_res = subprocess.run(
             ["git", "status", "--porcelain", "--", *pathspec],
             cwd=dest,
             capture_output=True,
             text=True,
+            timeout=_GIT_TIMEOUT,
         )
         diff_text = diff_res.stdout
         excluded = {e.strip() for e in list(authored) + list(exclude or []) if e.strip()}
@@ -195,7 +217,9 @@ class WorktreeManager:
                 if dest.exists():
                     shutil.rmtree(dest, ignore_errors=True)
 
-        subprocess.run(["git", "worktree", "prune"], cwd=self.repo_root, capture_output=True)
+        subprocess.run(
+            ["git", "worktree", "prune"], cwd=self.repo_root, capture_output=True, timeout=_GIT_TIMEOUT
+        )
 
     def cleanup_session(self, session_id: str) -> List[str]:
         """Delete all active worktrees associated with a session."""
@@ -209,7 +233,9 @@ class WorktreeManager:
                 self.remove(session_id, label, force=True)
                 cleaned.append(str(p))
 
-        subprocess.run(["git", "worktree", "prune"], cwd=self.repo_root, capture_output=True)
+        subprocess.run(
+            ["git", "worktree", "prune"], cwd=self.repo_root, capture_output=True, timeout=_GIT_TIMEOUT
+        )
         return cleaned
 
     def apply_to_repo(
@@ -256,6 +282,7 @@ class WorktreeManager:
             cwd=dest,
             capture_output=True,
             text=True,
+            timeout=_GIT_TIMEOUT,
         )
         if add_res.returncode != 0:
             raise WorktreeError(
@@ -267,6 +294,7 @@ class WorktreeManager:
             cwd=dest,
             capture_output=True,
             text=True,
+            timeout=_GIT_TIMEOUT,
         )
         if patch_res.returncode != 0:
             raise WorktreeError(
@@ -302,6 +330,7 @@ class WorktreeManager:
             input=patch,
             capture_output=True,
             text=True,
+            timeout=_GIT_TIMEOUT,
         )
         if apply_res.returncode != 0:
             raise WorktreeError(f"Failed to apply patch to repository:\n{apply_res.stderr}")

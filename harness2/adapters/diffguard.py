@@ -44,6 +44,10 @@ class PatchStats:
     deleted: tuple[str, ...] = ()
     bytes_added: int = 0
     bytes_removed: int = 0
+    # False when the patch could not be read at all. A patch nobody can parse
+    # might delete anything, so the guard refuses it rather than waving it
+    # through.
+    parseable: bool = True
 
     @property
     def files_changed(self) -> int:
@@ -52,7 +56,7 @@ class PatchStats:
     @property
     def destructive(self) -> bool:
         """Does this patch remove files that were there?"""
-        return bool(self.deleted)
+        return bool(self.deleted) or not self.parseable
 
     def to_dict(self) -> dict:
         return {
@@ -63,13 +67,21 @@ class PatchStats:
             "bytes_added": self.bytes_added,
             "bytes_removed": self.bytes_removed,
             "destructive": self.destructive,
+            "parseable": self.parseable,
         }
 
 
 def _paths(block: str) -> tuple[str | None, str | None]:
-    """The (old, new) path of one diff block, from its --- / +++ lines."""
+    """The (old, new) path of one diff block, from its --- / +++ lines.
+
+    The scan stops at the hunk header: a line INSIDE a hunk that starts with
+    `--- ` or `+++ ` is a source line, and reading it as a path made a
+    deleted file be reported under the name of a comment in its own body.
+    """
     old = new = None
     for line in block.splitlines():
+        if line.startswith("@@"):
+            break
         if line.startswith("--- "):
             old = line[4:].split("\t", 1)[0].strip()
         elif line.startswith("+++ "):
@@ -101,6 +113,11 @@ def analyze_patch(patch: str) -> PatchStats:
     bytes_removed = 0
 
     blocks = _DIFF_HEADER.split(patch)
+    if len(blocks) == 1:
+        # No `diff --git` header. The patch is not in a shape this reader
+        # understands, so it might do anything -- and the guard must not wave
+        # an unreadable patch through.
+        return PatchStats(parseable=False)
     for block in blocks[1:]:
         old, new = _paths(block)
         is_new = "new file mode" in block
@@ -136,6 +153,11 @@ def analyze_patch(patch: str) -> PatchStats:
 
 def describe_destructive(stats: PatchStats, *, limit: int = 12) -> str:
     """One sentence saying what the patch would destroy, for a refusal message."""
+    if not stats.parseable:
+        return (
+            "the patch could not be read, so what it would remove is unknown. "
+            "It is not in a format this harness can check"
+        )
     shown = list(stats.deleted[:limit])
     more = len(stats.deleted) - len(shown)
     names = ", ".join(f"`{p}`" for p in shown)

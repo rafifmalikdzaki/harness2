@@ -235,7 +235,11 @@ _AGENTS_MD_TITLE = "# AGENTS.md instructions"
 def _clip(s, n: int) -> str:
     s = "" if s is None else str(s)
     s = s.replace("\x00", "")
-    if n <= 0 or len(s) <= n:
+    if n <= 0:
+        # A budget of zero means NO text, not "no limit". Returning the whole
+        # string here meant an unbounded observation reached the model.
+        return ""
+    if len(s) <= n:
         return s
     return s[:n] + _TRUNC_FMT.format(n=len(s) - n)
 

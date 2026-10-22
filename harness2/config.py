@@ -53,8 +53,15 @@ def load_dotenv(path: Path = ROOT / ".env") -> None:
         if not key or not all(c.isalnum() or c == "_" for c in key):
             continue
         value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-            value = value[1:-1]
+        # A quoted value: everything up to the matching quote is the value,
+        # and a `#` inside it is part of the value, not a comment. The order
+        # of these two steps matters: stripping the comment first left the
+        # quotes in the value, so an API key written that way was corrupt and
+        # failed as a 401 much later.
+        if value[:1] in ("'", '"'):
+            quote = value[0]
+            end = value.find(quote, 1)
+            value = value[1:end] if end > 0 else value[1:]
         elif " #" in value:
             value = value.split(" #", 1)[0].rstrip()
         os.environ.setdefault(key, value)
@@ -121,13 +128,20 @@ OPENCODE_DIR = DEPENDENCIES / "opencode"
 BUN = DEPENDENCIES / "tools" / "node_modules" / ".bin" / "bun"
 LAB_PYTHON = lab_repo() / ".venv" / "bin" / "python"
 LAB_JUDGE_MODEL = (
-    "vertex/" + JUDGE_MODEL if JUDGE_MODEL.startswith(("claude", "gemini")) else JUDGE_MODEL
+    # Only a BARE id gets the Vertex prefix. A judge id that already names
+    # its provider became "vertex/anthropic/claude-sonnet-4", which is not a
+    # model anybody can run.
+    "vertex/" + JUDGE_MODEL
+    if "/" not in JUDGE_MODEL and JUDGE_MODEL.startswith(("claude", "gemini"))
+    else JUDGE_MODEL
 )
 LAB_DELIV_CAP = 60000
 JB_JUDGE_PYTHON = jb_repo() / ".venv" / "bin" / "python"
 JB_JUDGE_MODEL = (
     "google/" + JUDGE_MODEL
-    if JUDGE_MODEL.startswith("gemini") and not env("HARNESS2_JUDGE_BASE_URL")
+    if "/" not in JUDGE_MODEL
+    and JUDGE_MODEL.startswith("gemini")
+    and not env("HARNESS2_JUDGE_BASE_URL")
     else JUDGE_MODEL
 )
 _vertex_host = (
@@ -142,7 +156,7 @@ VERTEX_OPENAI_URL = (
 JB_JUDGE_API_BASE = env("HARNESS2_JUDGE_BASE_URL", VERTEX_OPENAI_URL if VERTEX_PROJECT else "")
 JB_JUDGE_API_KEY = env("HARNESS2_JUDGE_API_KEY", "")
 JB_JUDGE_REASONING_EFFORT = "low"
-JB_REPORTING_JUDGE_DETAILS = ""
+JB_REPORTING_JUDGE_DETAILS = env("HARNESS2_JB_REPORTING_JUDGE_DETAILS", "")
 JB_OBS_TRUNC = 50000
 
 CODEX_VERSION = "0.144.6"

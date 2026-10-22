@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import uuid
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
@@ -54,7 +55,12 @@ def _unblob(value: Optional[str]) -> Optional[str]:
         raw = bytes.fromhex(value[len(_GZIP_PREFIX) :])
     except ValueError:
         return value
-    return decompress_text(raw)
+    try:
+        return decompress_text(raw)
+    except (OSError, EOFError, zlib.error):
+        # A corrupt blob used to raise out of the reader, which took the whole
+        # session record with it.
+        return value
 
 
 def _unblob_row(row: Dict[str, Any]) -> Dict[str, Any]:

@@ -608,11 +608,28 @@ class LabAdapter:
         finally:
             if install.extras.get("harness") == "staged":
                 shutil.rmtree(install.staging_dir, ignore_errors=True)
-        if not (out / "metrics.json").is_file():
+        metrics_path = out / "metrics.json"
+        if not metrics_path.is_file():
             raise RuntimeError(
                 f"LAB rollout did not produce metrics.json: {out} — the runner refuses to "
                 f"write it when the session stream had no parseable events (dead chain / "
                 f"missing binary), so this failure must not be cached"
+            )
+        # The contract above is the CODEX runner's. The OpenCode runner writes
+        # metrics.json whatever happened, so a rollout that died on a 401 was
+        # marked complete, cached, and scored as a real zero. The adapter
+        # enforces the contract on both substrates.
+        metrics = _json_or_none(metrics_path)
+        if metrics is None:
+            raise RuntimeError(
+                f"LAB rollout produced an unreadable metrics.json: {metrics_path} — "
+                f"leaving it UNMARKED so the next attempt re-rolls"
+            )
+        if not metrics.get("turn_count") and not metrics.get("tool_calls"):
+            raise RuntimeError(
+                f"LAB rollout produced no parseable session events: {out} — a dead chain "
+                f"(auth/proxy/binary) is not a zero; leaving it UNMARKED so the next "
+                f"attempt re-rolls"
             )
         self._check_tool_gate(out)
         RM.mark_complete(
@@ -862,6 +879,14 @@ class LabAdapter:
                     text=True,
                     timeout=300,
                 )
+                if r.returncode != 0:
+                    # The probe interpreter died. Its stderr says why; the
+                    # JSON error said "Expecting value", which blamed the
+                    # harness for a broken probe.
+                    raise ValueError(
+                        f"the render probe failed (rc={r.returncode}): "
+                        f"{(r.stderr or '').strip()[-400:]}"
+                    )
                 got = json.loads(r.stdout)
             except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
                 raise ValueError(f"harness does not render: {exc}") from exc

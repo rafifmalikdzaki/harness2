@@ -736,14 +736,25 @@ class WbAdapter:
         return order_graded_first(newest, _trial_graded)
 
     def _cell_identity(self) -> dict:
-        """What makes two rollouts of one label the same rollout, beyond the harness."""
-        return {
+        """What makes two rollouts of one label the same rollout, beyond the harness.
+
+        The harness version belongs to the SUBSTRATE's own cell: the CodeX
+        cell runs the codex harness, so it records the codex version. It
+        recorded the OpenCode one, so bumping the CodeX harness left the
+        identity unchanged (a stale rollout was reused) and bumping the
+        OpenCode one changed it (every CodeX rollout was re-paid).
+        """
+        ident = {
             "solver": config.SOLVER_MODEL_OC
             if self.substrate.name == "oc"
             else config.SOLVER_MODEL_CX,
-            "oc_ver": config.WB_OC_HARNESS_VER,
             "connection": config.WB_MODEL_CONNECTION,
         }
+        if self.substrate.name == "oc":
+            ident["oc_ver"] = config.WB_OC_HARNESS_VER
+        else:
+            ident["cx_ver"] = config.WB_CX_HARNESS_VER
+        return ident
 
     def _identity_matches(self, trial: Path) -> bool:
         """True when `trial`'s marker names this cell's executor identity."""
@@ -842,18 +853,40 @@ class WbAdapter:
             return [t for t in self._trials(label, task_id) if self._reusable(t, harness_dir)]
 
         mine = _mine()
+        fresh: list[Path] = []
         if len(mine) < k:
             install = self._install(harness_dir)
             try:
                 fresh = self.substrate.execute(task_id, install, list(run_ids), int(timeout or 0))
             finally:
                 self._drop_staging(install)
-            for t in fresh:
+            # Each trial is marked with ITS OWN run id. They all shared the
+            # first one, so a trial could not be matched back to the rollout
+            # it was.
+            for t, rid in zip(fresh, list(run_ids) + [None] * max(0, len(fresh) - len(run_ids))):
                 if not RM.read_mark(t):
                     RM.mark_complete(
-                        t, run_id=run_ids[0], harness_dir=harness_dir, extra=self._cell_identity()
+                        t,
+                        run_id=rid or run_ids[0],
+                        harness_dir=harness_dir,
+                        extra=self._cell_identity(),
                     )
             mine = _mine()
+        # The trials are returned in the CALLER'S order. The caller pairs them
+        # with the run ids positionally, so a ranked list gave a rollout
+        # another rollout's run id -- and a base fallback's recorded run id
+        # named a run that produced a different artifact.
+        if len(fresh) == k:
+            return fresh
+        by_run_id: dict[str, Path] = {}
+        for t in mine:
+            m = RM.read_mark(t) or {}
+            rid = str(m.get("run_id") or "")
+            if rid and rid not in by_run_id:
+                by_run_id[rid] = t
+        ordered = [by_run_id[rid] for rid in run_ids if rid in by_run_id]
+        if len(ordered) == k:
+            return ordered
         return self._rank(mine)[:k]
 
     def delivered(self, run_dir: Path) -> bool:

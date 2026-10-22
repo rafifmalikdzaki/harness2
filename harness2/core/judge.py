@@ -45,8 +45,16 @@ class Scored:
 
     @property
     def graded(self) -> bool:
-        """Whether the judge succeeded, not whether the run did well."""
-        return self.n_criteria is not None and self.n_criteria > 0
+        """Whether the judge succeeded, not whether the run did well.
+
+        Both numbers have to be there. A row with a criterion count and no
+        pass count was 'graded', and the report then divided None by it.
+        """
+        return (
+            isinstance(self.n_criteria, (int, float))
+            and self.n_criteria > 0
+            and isinstance(self.n_passed, (int, float))
+        )
 
     @property
     def frac(self) -> float | None:
@@ -83,6 +91,15 @@ def judge_one(
     s.raw = dict(got)
     s.n_passed = got.get("n_passed")
     s.n_criteria = got.get("n_criteria")
+    # A malformed payload is an adapter problem, not a score. It becomes an
+    # error so the row is ungraded, instead of a "graded" row that crashes
+    # the report when the mean is taken.
+    if s.n_criteria is not None and not isinstance(s.n_criteria, (int, float)):
+        s.error = f"judge returned a non-numeric n_criteria: {s.n_criteria!r}"
+        s.n_criteria = None
+    if s.n_passed is not None and not isinstance(s.n_passed, (int, float)):
+        s.error = f"judge returned a non-numeric n_passed: {s.n_passed!r}"
+        s.n_passed = None
     s.all_pass = bool(got.get("all_pass", s.graded and s.n_passed == s.n_criteria))
     return s
 

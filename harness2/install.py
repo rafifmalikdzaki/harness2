@@ -87,6 +87,14 @@ def clone(name: str, *, dry_run=False):
             capture_output=True,
             text=True,
         )
+        if origin.returncode != 0:
+            # The git failure is the cause. Without this check the empty
+            # stdout looked like a wrong origin, and the operator was told to
+            # move the checkout aside.
+            raise RuntimeError(
+                f"could not read the git remote of {repo}: "
+                f"{(origin.stderr or '').strip()[-300:] or 'git failed'}"
+            )
         if any(path.name != ".git" for path in repo.iterdir()) or (
             origin.stdout.strip() != config.DEPENDENCY_ORIGINS[name]
         ):

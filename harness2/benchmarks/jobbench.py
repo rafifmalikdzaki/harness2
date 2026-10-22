@@ -364,6 +364,55 @@ JOBBENCH_PROFESSIONS: dict[str, str] = {
 }
 
 
+# Which of the seven DOMAIN LENS groups each occupation belongs to.
+#
+# The occupation directory is the first path segment of a JobBench task id,
+# so `domain_of()` returns it -- and it is NOT one of the seven domain names.
+# Passing it as the domain made every lookup miss, and all seven hand-written
+# DOMAIN LENS paragraphs were dead text that never reached a solver prompt.
+JOBBENCH_DOMAIN_OF_PROFESSION: dict[str, str] = {
+    "biostatisticians": "Computer / Mathematical",
+    "bookkeeping_accounting_and_auditing_clerks": "Business / Financial Ops",
+    "civil_engineers": "Architecture / Engineering",
+    "computer_and_information_research_scientists": "Computer / Mathematical",
+    "computer_and_information_systems_managers": "Management",
+    "computer_user_support_specialists": "Office / Admin Support",
+    "court_clerks": "Other (Legal·Sales·Sci·Edu)",
+    "customer_service_representatives": "Office / Admin Support",
+    "data_entry_keyers": "Office / Admin Support",
+    "financial_managers_branch_or_department": "Management",
+    "human_resources_specialists": "Office / Admin Support",
+    "lawyers": "Other (Legal·Sales·Sci·Edu)",
+    "licensing_examiners_and_inspectors": "Other (Legal·Sales·Sci·Edu)",
+    "management_analysts": "Management",
+    "mechanical_engineering_technicians": "Architecture / Engineering",
+    "mechanical_engineers": "Architecture / Engineering",
+    "medical_and_health_services_managers": "Management",
+    "medical_secretaries": "Office / Admin Support",
+    "online_merchants": "Business / Financial Ops",
+    "personal_financial_advisors": "Business / Financial Ops",
+    "petroleum_engineers": "Architecture / Engineering",
+    "police_fire_and_ambulance_dispatchers": "Office / Admin Support",
+    "producers": "Arts / Media",
+    "purchasing_agents_except_wholesale_retail_and_farm_products": "Business / Financial Ops",
+    "reporters_and_correspondents": "Arts / Media",
+    "sales_agents_securities_and_commodities": "Other (Legal·Sales·Sci·Edu)",
+    "sales_representatives_wholesale_and_manufacturing_technical_and_scientific_products": (
+        "Other (Legal·Sales·Sci·Edu)"
+    ),
+    "secretaries_and_administrative_assistants_except_legal_medical_and_executive": (
+        "Office / Admin Support"
+    ),
+    "social_science_research_assistants": "Other (Legal·Sales·Sci·Edu)",
+    "sociology_teachers_postsecondary": "Other (Legal·Sales·Sci·Edu)",
+    "statisticians": "Computer / Mathematical",
+    "supply_chain_managers": "Management",
+    "technical_writers": "Arts / Media",
+    "training_and_development_specialists": "Office / Admin Support",
+    "web_administrators": "Computer / Mathematical",
+}
+
+
 def jobbench_prompts(*, domain: str = "", profession: str = "") -> BenchPrompts:
     """JobBench-wide profile plus SOC-style domain and occupation overlays."""
     return _with_guidance(
@@ -541,7 +590,11 @@ class JobBenchAdapter:
         return sorted(set(discover("jb").values()))
 
     def prompts_for(self, task_id: str) -> BenchPrompts:
-        return jobbench_prompts(domain=self.domain_of(task_id), profession=task_id.split("/", 1)[0])
+        profession = task_id.split("/", 1)[0]
+        # The DOMAIN LENS is looked up by the DOMAIN GROUP, not by the
+        # occupation. Passing the occupation made every lookup miss.
+        domain = JOBBENCH_DOMAIN_OF_PROFESSION.get(profession, "")
+        return jobbench_prompts(domain=domain, profession=profession)
 
     def task_prompt(self, task_id: str) -> str:
         """TASK_INSTRUCTIONS.txt, as the agent received it."""
@@ -676,24 +729,31 @@ class JobBenchAdapter:
     def _launch_opencode(self, req: RunRequest, install: Install) -> list[Path]:
         task_id, label, t = self._launch_common(req)
         self.substrate.preflight()
+        # The rendered tree is scratch: a sweep is 4k rollouts per task, and
+        # every one of them used to leave a directory behind in /tmp.
         render_dir = Path(tempfile.mkdtemp(prefix=f"hrender_{label}_"))
-        render_opencode_tree(install.staging_dir, render_dir, _render_ctx(self.domain_of(task_id)))
-        env = {
-            **os.environ,
-            "TASK_IDS": task_id,
-            "LABEL": label,
-            "HARNESS_RENDER_DIR": str(render_dir),
-            "AGENT_NAME": "",
-            "TASKS_BASE_DIR": str(self.store),
-            "OPENCODE_DIR": str(config.OPENCODE_DIR),
-            "MODEL_ID": config.SOLVER_MODEL_OC,
-            "TIMEOUT_PER_TASK": str(t),
-            "MAX_RETRIES": "2",
-            "MAX_CONCURRENT": "1",
-            "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": str(OUTPUT_TOKEN_MAX),
-        }
-        self._run_runner(OC_RUNNER, env, wall=2 * t + 600, label=label)
-        return [self._require_artifacts(task_id, label)]
+        try:
+            render_opencode_tree(
+                install.staging_dir, render_dir, _render_ctx(self.domain_of(task_id))
+            )
+            env = {
+                **os.environ,
+                "TASK_IDS": task_id,
+                "LABEL": label,
+                "HARNESS_RENDER_DIR": str(render_dir),
+                "AGENT_NAME": "",
+                "TASKS_BASE_DIR": str(self.store),
+                "OPENCODE_DIR": str(config.OPENCODE_DIR),
+                "MODEL_ID": config.SOLVER_MODEL_OC,
+                "TIMEOUT_PER_TASK": str(t),
+                "MAX_RETRIES": "2",
+                "MAX_CONCURRENT": "1",
+                "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": str(OUTPUT_TOKEN_MAX),
+            }
+            self._run_runner(OC_RUNNER, env, wall=2 * t + 600, label=label)
+            return [self._require_artifacts(task_id, label)]
+        finally:
+            shutil.rmtree(render_dir, ignore_errors=True)
 
     def _launch_codex(self, req: RunRequest, install: Install) -> list[Path]:
         task_id, label, t = self._launch_common(req)
@@ -740,7 +800,10 @@ class JobBenchAdapter:
 
     def _require_artifacts(self, task_id: str, label: str) -> Path:
         out, traj = self._out_dir(task_id, label), self._traj_dir(task_id, label)
-        has_out = out.is_dir() and any(out.iterdir())
+        # A directory containing only an empty subdirectory is not an output.
+        # `any(out.iterdir())` said it was, so the rollout was marked
+        # complete and later scored as a real zero.
+        has_out = out.is_dir() and any(p.is_file() for p in out.rglob("*"))
         if not has_out:
             # A trajectory is not liveness: an attempt abandoned on a 401 or a rate-limit
             # storm still leaves .jsonl events behind. Both launchers already exit
@@ -1042,8 +1105,16 @@ class JobBenchAdapter:
             if details is None:
                 continue
             got = self._read_details(details)
-            if got is not None:
-                return _parse_details(got)
+            if got is None:
+                continue
+            parsed = _parse_details(got)
+            if parsed is not None:
+                return parsed
+            # The details are there but carry no score. Returning None here
+            # skipped the judge entirely, and the stale file was never
+            # quarantined -- so the run stayed ungraded forever, even when
+            # the judge would now have succeeded.
+            details.with_name(details.name + ".unscoreable").unlink(missing_ok=True)
         if not self.delivered(run_dir):
             return self._no_output_score(task_id)
         if not self._run_judge(task_id, label, run_dir):
