@@ -217,7 +217,9 @@ def _restore_libraries(
         ):
             continue
         n = Namespace(adapter.spec.name, adapter.substrate.name, mode, k, seed, tag)
-        tree = harness_tree.read_tree(surface, n.task_dir(runs_root, task_id) / "harnesses" / label)
+        tree = harness_tree.read_tree(
+            surface, harness_tree.run_harness_dir(n.task_dir(runs_root, task_id), label)
+        )
         if not tree:
             continue
         lib.add(
@@ -241,6 +243,11 @@ class TaskResult:
     selections: dict = field(default_factory=dict)
     base: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Things that went wrong but did not invalidate the result. A failed
+    # reflection costs the lesson, not the run: recording it as an error made
+    # the task 'partial', which made it unresumable, which re-paid the whole
+    # task on every later sweep.
+    warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -253,6 +260,7 @@ class TaskResult:
             "modes": self.modes,
             "selections": self.selections,
             "errors": self.errors,
+            "warnings": self.warnings,
         }
 
 
@@ -280,10 +288,12 @@ def _load_old(path: Path) -> dict:
         return {}
 
 
-def _write_summary(summary_path: Path, res: TaskResult) -> None:
+def _write_summary(summary_path: Path, res: TaskResult) -> dict:
     """Merge `res` into the summary under an flock, atomically, deriving the merged status.
 
     Modes may be written by separate processes, so records accumulate per mode.
+    Returns the merged record, so the caller reports the status that was
+    actually written rather than the one it had in hand.
     """
     import fcntl
 
@@ -313,11 +323,15 @@ def _write_summary(summary_path: Path, res: TaskResult) -> None:
                         continue
                     if json.dumps(e, sort_keys=True, default=str) not in seen:
                         merged["errors"].append(e)
-                if merged.get("status") in ("ok", "partial"):
-                    merged["status"] = _merged_status(merged)
+            # The status is always derived from the MERGED record, not from
+            # this process's own modes. Deriving it only when the file already
+            # existed meant a fresh task stored one status and a re-run stored
+            # another, and the two did not mean the same thing.
+            merged["status"] = _merged_status(merged)
             tmp = summary_path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(merged, indent=2, default=str))
             os.replace(tmp, summary_path)
+            return merged
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
 
@@ -352,8 +366,14 @@ def _resume(
     tag: str,
     mode_libs: dict[str, library_store.Library],
     res: TaskResult,
-) -> bool:
-    """Fill `res` from a cached summary covering every requested mode; True if it did."""
+) -> set[str]:
+    """Fill `res` from a cached summary; return the modes it can cover.
+
+    The modes are independent -- each has its own namespace and its own
+    ledger -- so one mode's failure does not have to re-pay another's work.
+    A mode is covered when its record, its selection and the artifacts that
+    selection points at are all still there and unchanged.
+    """
     try:
         got = json.loads(summary_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
@@ -361,30 +381,22 @@ def _resume(
             f"  [{task_id}] unreadable summary.json ({type(exc).__name__}: {exc}); re-running",
             flush=True,
         )
-        return False
-    if got.get("status") != "ok":
-        return False
+        return set()
     cached_modes = _modes_of(got)
     cached_sels = got.get("selections") or {}
-    missing = sorted(
-        m
-        for m in modes
-        if not (
-            (cached_modes.get(m) or {}).get("ok")
-            and (cached_sels.get(m) or {}).get("ok")
-            and (cached_sels.get(m) or {}).get("chosen_label")
-        )
-    )
-    if missing:
-        print(
-            f"  [{task_id}] cached summary covers {sorted(cached_modes)}, re-running for {missing}",
-            flush=True,
-        )
-        return False
+    covered: set[str] = set()
     for mode in modes:
-        sel = cached_sels[mode]
+        sel = cached_sels.get(mode) or {}
+        if not (
+            (cached_modes.get(mode) or {}).get("ok")
+            and sel.get("ok")
+            and sel.get("chosen_label")
+        ):
+            continue
         namespace = Namespace(adapter.spec.name, adapter.substrate.name, mode, k, seed, tag)
-        harness_dir = namespace.task_dir(runs_root, task_id) / "harnesses" / sel["chosen_label"]
+        harness_dir = harness_tree.run_harness_dir(
+            namespace.task_dir(runs_root, task_id), sel["chosen_label"]
+        )
         run_dir = Path(sel.get("chosen_run_dir") or "")
         try:
             if not sel.get("chosen_run_dir") or not run_dir.is_dir():
@@ -404,15 +416,28 @@ def _resume(
             if fingerprint and runmark.fingerprint(harness_dir) != fingerprint:
                 raise ValueError("adopted harness has changed")
         except (OSError, RuntimeError, ValueError) as exc:
-            print(f"  [{task_id}] cannot resume {mode}: {exc}; re-running", flush=True)
-            return False
-    res.status = "skipped"
+            print(f"  [{task_id}] cannot resume {mode}: {exc}; re-running it", flush=True)
+            continue
+        covered.add(mode)
+
+    if not covered:
+        return set()
+
+    missing = sorted(set(modes) - covered)
+    if missing:
+        print(
+            f"  [{task_id}] cached summary covers {sorted(covered)}, re-running for {missing}",
+            flush=True,
+        )
+    # Carry the covered modes into the result; the caller runs the rest.
+    for mode in covered:
+        res.modes[mode] = cached_modes.get(mode) or {}
+        res.selections[mode] = cached_sels.get(mode) or {}
     res.base = got.get("base", [])
-    res.modes = cached_modes
-    res.selections = cached_sels
-    res.errors = got.get("errors", [])
-    _restore_libraries(task_id, k, adapter, runs_root, modes, seed, tag, mode_libs, res.selections)
-    return True
+    _restore_libraries(
+        task_id, k, adapter, runs_root, sorted(covered), seed, tag, mode_libs, res.selections
+    )
+    return covered
 
 
 def _dead(label: str, rid: str, dead_dir: Path, error: str) -> RunView:
@@ -504,6 +529,11 @@ def _run_one_mode(
         library_dir=lib_dir,
     )
     res.modes[mode] = r.to_dict()
+    if r.learned_nothing:
+        res.errors.append(
+            f"{mode}: every improvement stage fell back to the inherited harness, "
+            f"so nothing was learned. The improver produced no usable proposal."
+        )
     candidates = selection.selection_pool(
         mode, k, r.rollouts, base, include_base=(pool_policy == "finals+base")
     )
@@ -530,7 +560,6 @@ def _run_one_mode(
             sel = selection.failed_selection(
                 task_id, k, mode, candidates, error=f"{type(exc).__name__}: {exc}"
             )
-            res.errors.append(f"{mode}: selection failed: {sel.error}")
     if mode_lib and sel.ok:
         try:
             selection.reflect_adoption(
@@ -544,8 +573,11 @@ def _run_one_mode(
             )
         except Exception as exc:
             # The lesson is a bonus on top of a selection that already happened.
-            # Losing it must not lose the selection.
-            res.errors.append(f"{mode}: reflection failed: {type(exc).__name__}: {exc}")
+            # Losing it must not lose the selection -- and it must not make the
+            # task unresumable, which would re-pay it on every later sweep.
+            res.warnings.append(f"{mode}: reflection failed: {type(exc).__name__}: {exc}")
+    if sel.reflection_error:
+        res.warnings.append(f"{mode}: reflection failed: {sel.reflection_error}")
     d = sel.to_dict()
     d["chosen_run_dir"] = str(
         candidates[sel.chosen_label].run_dir if sel.chosen_label in candidates else ""
@@ -555,7 +587,9 @@ def _run_one_mode(
     chosen_tree_is_base = _tree_is_base(surface, base_tree, chosen_tree)
     d["chosen_tree_is_base"] = chosen_tree_is_base
     if sel.chosen_label:
-        d["harness_fingerprint"] = runmark.fingerprint(work_dir / "harnesses" / sel.chosen_label)
+        d["harness_fingerprint"] = runmark.fingerprint(
+            harness_tree.run_harness_dir(work_dir, sel.chosen_label)
+        )
     res.selections[mode] = d
     if not sel.ok:
         if sel.fallback:
@@ -626,9 +660,14 @@ def run_task(
     work.mkdir(parents=True, exist_ok=True)
     summary_path = work / "summary.json"
 
-    if summary_path.is_file() and _resume(
-        summary_path, task_id, k, adapter, runs_root, modes, seed, tag, mode_libs, res
-    ):
+    covered: set[str] = set()
+    if summary_path.is_file():
+        covered = _resume(
+            summary_path, task_id, k, adapter, runs_root, modes, seed, tag, mode_libs, res
+        )
+    todo = [m for m in modes if m not in covered]
+    if not todo:
+        res.status = "skipped"
         return res
 
     surface = adapter.substrate.surface()
@@ -650,7 +689,7 @@ def run_task(
         _write_summary(summary_path, res)
         return res
 
-    for mode in modes:
+    for mode in todo:
         n = Namespace(bench, sub, mode, k, seed, tag)
         try:
             _run_one_mode(
@@ -679,8 +718,11 @@ def run_task(
         res.status = "partial"
         _write_summary(summary_path, res)
 
-    res.status = _merged_status(res.to_dict())
-    _write_summary(summary_path, res)
+    # The status that was WRITTEN is the status to report: the summary merges
+    # per-mode records from other processes, so the caller's own view of the
+    # task can be older than the file on disk.
+    merged = _write_summary(summary_path, res)
+    res.status = str(merged.get("status") or res.status)
     return res
 
 

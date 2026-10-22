@@ -59,6 +59,18 @@ class Progress:
     # emitting
     # ------------------------------------------------------------------
 
+    def begin_task(self, *, total_stages: int = 0, total_rollouts: int = 0) -> None:
+        """Start a new task's counters.
+
+        The counters are per task, not per run: without a reset, a second
+        task in the same run reported "stage 24/6".
+        """
+        with self._lock:
+            self.total_stages = total_stages
+            self.total_rollouts = total_rollouts
+            self._stage_n = 0
+            self._rollout_n = 0
+
     def event(self, kind: str, **fields: Any) -> dict:
         """Record one event and write it out. Never raises: a broken pipe is
         not a reason to lose a run."""

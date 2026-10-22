@@ -130,6 +130,36 @@ def test_a_deletion_is_refused_until_it_is_asked_for(tmp_path):
     assert not (repo / "app.py").exists()
 
 
+def test_the_harnesss_own_files_are_not_applied(tmp_path):
+    """The harness's AGENTS.md is scaffolding, not the agent's work.
+
+    The diff excluded it and the apply did not, so accepting a candidate
+    wrote the harness's instructions into the user's repository.
+    """
+    repo = make_repo(tmp_path)
+    mgr = WorktreeManager(repo, base_temp_dir=tmp_path / "wt")
+    wt = mgr.create("sess_test", "cand")
+
+    # The harness stages its instructions and records what it wrote.
+    (wt / "AGENTS.md").write_text("# harness instructions\n", encoding="utf-8")
+    (wt / ".harness_staged").mkdir()
+    (wt / ".harness_staged" / "systemprompt.md").write_text("x\n", encoding="utf-8")
+    (wt / ".harness_authored").write_text("AGENTS.md\n.harness_staged/systemprompt.md\n", encoding="utf-8")
+
+    # The agent changes something of its own.
+    (wt / "app.py").write_text("print('v1')\nprint('v2')\n", encoding="utf-8")
+
+    diff = mgr.get_diff("sess_test", "cand")
+    assert "app.py" in diff
+    assert "AGENTS.md" not in diff
+
+    result = mgr.apply_to_repo("sess_test", "cand")
+    assert result["applied"], result
+    assert (repo / "app.py").read_text(encoding="utf-8").count("v2") == 1
+    assert not (repo / "AGENTS.md").exists(), "the harness's AGENTS.md was applied"
+    assert not (repo / ".harness_staged").exists()
+
+
 def test_a_broken_repository_raises_rather_than_reporting_success(tmp_path):
     repo = make_repo(tmp_path)
     mgr = WorktreeManager(repo, base_temp_dir=tmp_path / "wt")

@@ -27,6 +27,7 @@ from typing import Callable, Sequence, TypeVar
 
 from . import context
 from . import prompts as P
+from . import tree as harness_tree
 from .proposer import Proposer, ProposerError
 from .spec import BenchmarkAdapter, BenchPrompts, RunView, resolve_prompts
 
@@ -63,6 +64,9 @@ class Selection:
     experience: dict = field(default_factory=dict)
     trivial: bool = False
     evidence: str = "deliverable"
+    # A reflection that failed. The selection still stands; the lesson is
+    # missing, and the run must say so rather than lose it silently.
+    reflection_error: str = ""
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}
@@ -483,7 +487,9 @@ def reflect_adoption(
         adapter,
         task_id,
         list(candidates.values()),
-        harness_dir=harnesses / sel.chosen_label,
+        # The base rollouts share the base harness tree, so a selection that
+        # awarded the work to a base has no tree of its own.
+        harness_dir=harness_tree.run_harness_dir(work_dir, sel.chosen_label),
         pool=[
             (label, harnesses / label, rollout)
             for label, rollout in candidates.items()
@@ -545,6 +551,9 @@ def _distil(
         reply = prop.call(mission, exp_root, f"experience.{sel.mode}{sel.k}")
     except ProposerError as exc:
         sel.usd += exc.cost_usd
+        # The lesson is lost, but the run must say so. Swallowing this made a
+        # failed reflection completely invisible.
+        sel.reflection_error = str(exc)[:400]
         return {}
     sel.usd += reply.cost_usd
     edits = _EDITS.search(reply.text)
@@ -552,6 +561,7 @@ def _distil(
         (root / "edits.md").write_text(edits.group(1).strip() + "\n", encoding="utf-8")
     m = _EXP.search(reply.text)
     if not m:
+        sel.reflection_error = "the lesson session returned no <experience> block"
         return {}
     out: dict = {}
     for line in m.group(1).strip().splitlines():

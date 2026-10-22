@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from .. import llm
-from ..core import tree
+from ..core import runmark, tree
 from ..core.compress import read_text
 from ..core.memory_db import MemoryDB
 from ..core.spec import BenchPrompts, BenchSpec, ChannelSpec
@@ -334,6 +334,12 @@ class GeneralTaskAdapter:
             # aborts.
             grader_verdict_markers=(),
             verdict_policy="quarantine",
+            # A general task's deliverable is "the agent's work", which may be
+            # a diff OR a transcript: a solver that answered in prose has
+            # still produced something the selector can read. Without this,
+            # such a candidate was dropped and, if it was the only one, the
+            # whole task failed with "no candidate produced an artifact".
+            state_deliverable=True,
         )
         self._ensure_base_harness()
 
@@ -555,6 +561,14 @@ class GeneralTaskAdapter:
                 encoding="utf-8",
             )
             written.append("AGENTS.md")
+        # The record of what the harness wrote. The diff and the apply both
+        # read it, so the harness's own files cannot reach the deliverable:
+        # the apply used a different exclusion list, and the harness's
+        # AGENTS.md was applied to the repository as if the agent had written
+        # it.
+        (wt_path / ".harness_authored").write_text(
+            "\n".join(sorted(written)) + "\n", encoding="utf-8"
+        )
         return written
 
     def _run_opencode_solver(
@@ -632,8 +646,19 @@ class GeneralTaskAdapter:
         reason to run both.
         """
         label = run_id.replace("/", "__")
+        run_dir = self.spec.runs_root / self.session_id / label
+
+        # A rollout is idempotent by run_id, as the adapter protocol promises.
+        # Without the marker, an interrupted task re-paid for every rollout it
+        # had already done.
+        if runmark.is_complete(run_dir, harness_dir=harness_dir):
+            return run_dir
+
         wt_path = self.wt_mgr.create(self.session_id, label)
-        timeout = timeout or 600
+        # The adapter's own timeout is the one the caller asked for. The
+        # hard-coded 600s used to shadow it, so a caller who asked for 1800s
+        # got 600s and never found out.
+        timeout = timeout or self.timeout or 600
         strength = agent.verification_strength(self.verify_cmd)
         log: Dict[str, object] = {"strategy": strategy, "verification_strength": strength}
 
@@ -641,7 +666,6 @@ class GeneralTaskAdapter:
         staged = self._stage_harness(harness_dir, wt_path)
         harness_log["staged_paths"] = staged
         log["harness"] = harness_log
-
         provider = llm.resolve_provider()
         claims: List[str] = []
         verify_status: Optional[int] = None
@@ -724,7 +748,6 @@ class GeneralTaskAdapter:
             test_output=test_output,
         )
 
-        run_dir = self.spec.runs_root / self.session_id / label
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "diff.patch").write_text(git_diff, encoding="utf-8")
         (run_dir / "test_output.txt").write_text(test_output, encoding="utf-8")
@@ -737,6 +760,9 @@ class GeneralTaskAdapter:
             json.dumps({**log, "claims": claims, "test_passed": test_passed}, indent=2),
             encoding="utf-8",
         )
+        # Recorded last: the marker says the rollout finished, so it is only
+        # written once every artifact is on disk.
+        runmark.mark_complete(run_dir, run_id=run_id, harness_dir=harness_dir)
         return run_dir
 
     def delivered(self, run_dir: Path) -> bool:

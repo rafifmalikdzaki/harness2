@@ -44,6 +44,10 @@ def _run_git(args: List[str], cwd: Path) -> subprocess.CompletedProcess[str]:
 class WorktreeManager:
     """Manages the creation, inspection, and deletion of git worktrees."""
 
+    #: Internal files the harness writes into a worktree. They are scaffolding,
+    #: never the agent's work, and they must not reach the deliverable.
+    _INTERNAL = (".harness_staged", ".harness2", ".harness_authored", ".harness_traj")
+
     def __init__(self, repo_root: Path | str, base_temp_dir: Optional[Path | str] = None):
         self.repo_root = Path(repo_root).expanduser().resolve()
         if not (self.repo_root / ".git").exists():
@@ -54,6 +58,29 @@ class WorktreeManager:
             else Path("/tmp/harness2_worktrees")
         )
         self.base_temp_dir.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def authored_paths(cls, dest: Path | str) -> list[str]:
+        """The paths the harness itself wrote into a worktree.
+
+        Recorded when the harness is staged, and read back by both the diff
+        and the apply, so the two agree on what is scaffolding. Without this
+        the harness's own `AGENTS.md` was applied to the repository as if the
+        agent had written it.
+        """
+        marker = Path(dest) / ".harness_authored"
+        try:
+            body = marker.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+        return [line.strip() for line in body.splitlines() if line.strip()]
+
+    @classmethod
+    def _exclude_args(cls, extra: Sequence[str] = ()) -> list[str]:
+        """The pathspec exclusions: the harness's own files, and what it authored."""
+        args = [f":(exclude){name}" for name in cls._INTERNAL]
+        args += [f":(exclude){name}" for name in extra if str(name).strip()]
+        return args
 
     def branch_name(self, session_id: str, label: str) -> str:
         clean_sess = session_id.replace("sess_", "")
@@ -105,19 +132,19 @@ class WorktreeManager:
         if not dest.is_dir():
             return ""
 
+        # The paths the harness wrote are scaffolding. They are read BEFORE
+        # the staging directory is removed, because that is where the record
+        # of them lives.
+        authored = self.authored_paths(dest)
+
         # Remove internal scaffolding before computing diff
         staged_internal = dest / ".harness_staged"
         if staged_internal.exists():
             shutil.rmtree(staged_internal, ignore_errors=True)
 
-        pathspec = [
-            ":!.harness_staged",
-            ":!.harness2",
-            ":!.harness_authored",
-            ":!.harness_traj",
-        ]
-        for rel in exclude or []:
-            rel = rel.strip()
+        pathspec = [f":(exclude){name}" for name in self._INTERNAL]
+        for rel in list(authored) + list(exclude or []):
+            rel = str(rel).strip()
             if rel:
                 pathspec.append(f":(exclude){rel}")
 
@@ -134,14 +161,14 @@ class WorktreeManager:
             text=True,
         )
         diff_text = diff_res.stdout
-        excluded = {e.strip() for e in (exclude or []) if e.strip()}
+        excluded = {e.strip() for e in list(authored) + list(exclude or []) if e.strip()}
         # Only genuinely untracked paths belong in this section; modified files
         # are already in the diff above.
         clean_untracked = "\n".join(
             line
             for line in untracked_res.stdout.splitlines()
             if line.startswith("??")
-            and not line.endswith((".harness_staged/", ".harness2/"))
+            and not line.endswith(tuple(f"{n}/" for n in self._INTERNAL))
             and line[3:].strip() not in excluded
         ).strip()
         if clean_untracked:
@@ -207,15 +234,19 @@ class WorktreeManager:
         if not dest.is_dir():
             raise WorktreeError(f"Worktree directory {dest} does not exist.")
 
+        # The paths the harness wrote are scaffolding, not the agent's work.
+        # They are read BEFORE the staging directory is removed, because that
+        # is where the record of them lives.
+        authored = self.authored_paths(dest)
+
         # Ensure internal scaffolding is completely removed from worktree before staging
         staged_internal = dest / ".harness_staged"
         if staged_internal.exists():
             shutil.rmtree(staged_internal, ignore_errors=True)
 
-        # Stage untracked/modified files, explicitly ignoring internal directories & caches
-        exclude_args = [
-            ":(exclude).harness_staged",
-            ":(exclude).harness2",
+        # Stage untracked/modified files, explicitly ignoring internal
+        # directories, caches, and everything the harness authored.
+        exclude_args = self._exclude_args(authored) + [
             ":(exclude)__pycache__",
             ":(exclude)*.pyc",
             ":(exclude).pytest_cache",

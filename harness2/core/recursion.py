@@ -77,6 +77,17 @@ class ModeResult:
     def fell_back(self) -> list[str]:
         return [s.label for s in self.stages if s.fell_back]
 
+    @property
+    def learned_nothing(self) -> bool:
+        """Every stage fell back to the inherited harness: nothing was learned.
+
+        One stage falling back is normal -- that is what the retry is for.
+        Every stage falling back means the mode produced no improvement at
+        all, and reporting that as a success is how a broken improver looks
+        like a working one.
+        """
+        return bool(self.stages) and all(s.fell_back for s in self.stages)
+
     def to_dict(self) -> dict:
         return {
             "mode": self.mode,
@@ -85,6 +96,7 @@ class ModeResult:
             "finals": self.finals,
             "ok": self.ok,
             "fell_back": self.fell_back,
+            "learned_nothing": self.learned_nothing,
             "kept_base": [s.label for s in self.stages if s.kept_base],
             "stages": [
                 {
@@ -394,8 +406,7 @@ def run_parallel(
     ctx_dir = work_dir / "context"
     benchmark_prompts = resolve_prompts(adapter, task_id)
     base_dir = harness_tree.write_tree(surface, base_tree, work_dir / "harnesses" / "base")
-    progress.current().total_stages = 3 * k
-    progress.current().total_rollouts = 4 * k
+    progress.current().begin_task(total_stages=3 * k, total_rollouts=4 * k)
 
     specs = [(f"{d.lower()}{i}", d, i) for i in range(1, k + 1) for d in ("INV", "DOM")]
     with ThreadPoolExecutor(max_workers=min(len(specs), propose_workers)) as pool_x:
@@ -438,27 +449,35 @@ def run_parallel(
         for stage in stages
     ]
     agg_specs = [f"agg{i}" for i in range(1, k + 1)]
-    with ThreadPoolExecutor(max_workers=min(len(agg_specs), propose_workers)) as pool_x:
-        aggs = list(
-            pool_x.map(
-                lambda lbl: _run_stage(
-                    label=lbl,
-                    dim="AGG",
-                    job=prompts.aggregate(benchmark_prompts, surface, k=k, index=int(lbl[3:])),
-                    fallback=base_tree,
-                    adapter=adapter,
-                    prop=prop,
-                    ctx_dir=ctx_dir,
-                    task_id=task_id,
-                    rollouts=base,
-                    harness_dir=base_dir,
-                    library_dir=library_dir,
-                    pool=pool_ev,
-                    decisions={stage.label: stage.notes or stage.error for stage in stages},
-                ),
-                agg_specs,
+    try:
+        with ThreadPoolExecutor(max_workers=min(len(agg_specs), propose_workers)) as pool_x:
+            aggs = list(
+                pool_x.map(
+                    lambda lbl: _run_stage(
+                        label=lbl,
+                        dim="AGG",
+                        job=prompts.aggregate(benchmark_prompts, surface, k=k, index=int(lbl[3:])),
+                        fallback=base_tree,
+                        adapter=adapter,
+                        prop=prop,
+                        ctx_dir=ctx_dir,
+                        task_id=task_id,
+                        rollouts=base,
+                        harness_dir=base_dir,
+                        library_dir=library_dir,
+                        pool=pool_ev,
+                        decisions={stage.label: stage.notes or stage.error for stage in stages},
+                    ),
+                    agg_specs,
+                )
             )
-        )
+    except Exception as exc:
+        # The INV/DOM stages already ran, and their sessions, rollouts and
+        # notes are on disk. Losing the record of them because the COMPOSE
+        # phase raised throws away money that was already spent.
+        result.errors.append(f"composition failed: {type(exc).__name__}: {exc}")
+        result.ledger = ledger
+        return result
     _record_sessions(ledger, aggs)
     for stage in aggs:
         result.stages.append(stage)
@@ -504,8 +523,7 @@ def run_sequential(
     result.rollouts.update({r.label: r for r in base})
     ctx_dir = work_dir / "context"
     benchmark_prompts = resolve_prompts(adapter, task_id)
-    progress.current().total_stages = 3 * k
-    progress.current().total_rollouts = 4 * k
+    progress.current().begin_task(total_stages=3 * k, total_rollouts=4 * k)
 
     current_harness = dict(base_tree)
     history: list[tuple[str, Path, RunView | None]] = []
@@ -572,21 +590,29 @@ def run_sequential(
             if k == 1
             else prompts.compose_round(benchmark_prompts, surface, t=t, k=k)
         )
-        comp = _run_stage(
-            label=ck,
-            dim="COMPOSE",
-            job=comp_job,
-            fallback=current_harness,
-            adapter=adapter,
-            prop=prop,
-            ctx_dir=ctx_dir,
-            task_id=task_id,
-            rollouts=base,
-            harness_dir=current_dir,
-            library_dir=library_dir,
-            pool=round_pool,
-            decisions={stage.label: stage.notes or stage.error for stage in result.stages},
-        )
+        try:
+            comp = _run_stage(
+                label=ck,
+                dim="COMPOSE",
+                job=comp_job,
+                fallback=current_harness,
+                adapter=adapter,
+                prop=prop,
+                ctx_dir=ctx_dir,
+                task_id=task_id,
+                rollouts=base,
+                harness_dir=current_dir,
+                library_dir=library_dir,
+                pool=round_pool,
+                decisions={stage.label: stage.notes or stage.error for stage in result.stages},
+            )
+        except Exception as exc:
+            # The rounds that already ran are on disk. Losing their record
+            # because this round raised throws away money already spent.
+            result.errors.append(f"round {t} failed to compose: {type(exc).__name__}: {exc}")
+            result.ledger = ledger
+            result.finals = [f"c{index}" for index in range(1, t)]
+            return result
         _record_sessions(ledger, [comp])
         result.stages.append(comp)
         result.trees[ck] = comp.tree

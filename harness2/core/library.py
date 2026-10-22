@@ -210,16 +210,23 @@ class Library:
                 return 0.0
 
         by_cue: dict[str, str] = {}
+        cue_less: list[str] = []
         for name in sorted(names, key=learned_at):
             ed = self.dir / "harnesses" / name
             cue = (_field(ed / "EXPERIENCE.md", "cue") or "").strip().lower()
             if not cue:
+                # An entry with no cue cannot supersede anything, and it is not
+                # a duplicate of anything either. Retiring it deleted a
+                # learned harness that nothing had replaced.
+                cue_less.append(name)
                 continue
             by_cue[cue] = name  # the later one wins
 
         survivors = list(by_cue.values())
         if len(survivors) > keep:
             survivors = survivors[-keep:]
+        # The cue-less entries survive too: they are not superseded.
+        survivors = survivors + cue_less
 
         retired = 0
         for name in names:

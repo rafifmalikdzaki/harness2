@@ -55,6 +55,12 @@ class ContextTree:
     deliverables_mode: str = "contents"
     source_files: int = 0
     decisions: int = 0
+    # The rollouts whose deliverable is a DIRECTORY of files, and the ones
+    # whose deliverable is a single file. The mission points at one or the
+    # other, and pointing at the wrong one sends the model looking for a
+    # directory that is not there.
+    deliverable_dirs: list[str] = field(default_factory=list)
+    deliverable_files: list[str] = field(default_factory=list)
 
     @property
     def layout(self) -> str:
@@ -68,7 +74,17 @@ class ContextTree:
             names = ", ".join(f"{r}.md" for r in self.rollouts[:6])
             more = f" (+{len(self.rollouts) - 6} more)" if len(self.rollouts) > 6 else ""
             lines.append(f"context/rollouts/               FULL trajectories: {names}{more}")
-        if self.deliverables:
+        if self.deliverable_dirs:
+            names = ", ".join(self.deliverable_dirs[:6])
+            lines.append(
+                f"context/deliverables/<label>/    the files each rollout produced, "
+                f"one per artifact (browse INDEX.md for the set): {names}"
+            )
+        if self.deliverable_files:
+            names = ", ".join(f"{r}.md" for r in self.deliverable_files[:6])
+            lines.append(f"context/deliverables/<label>.md   the artifact that rollout produced: {names}")
+        if self.deliverables and not self.deliverable_dirs and not self.deliverable_files:
+            lines.append("context/deliverables/<label>    what each rollout produced")
             if self.deliverables_mode == "names":
                 lines.append(
                     "context/deliverables/<label>/    INDEX.md lists WHICH files each "
@@ -78,11 +94,6 @@ class ContextTree:
                     "                                 File contents are deliberately "
                     "not provided on this benchmark; work from the trajectories and "
                     "the file set itself."
-                )
-            else:
-                lines.append(
-                    "context/deliverables/<label>/    the files each rollout produced, "
-                    "one per artifact (browse INDEX.md for the set)"
                 )
         if self.harness_files:
             lines.append(
@@ -138,6 +149,8 @@ def build(
     got_r: list[str] = []
     got_d: list[str] = []
     failed_r: list[str] = []
+    deliverable_dirs: list[str] = []
+    deliverable_files: list[str] = []
     if rollouts:
         (dest / "rollouts").mkdir(exist_ok=True)
         (dest / "deliverables").mkdir(exist_ok=True)
@@ -149,6 +162,11 @@ def build(
         else:
             got_r.append(r.label)
         got_d.append(r.label)
+        # Which shape the deliverable took: a directory of files, or one file.
+        if (dest / "deliverables" / r.label).is_dir():
+            deliverable_dirs.append(r.label)
+        else:
+            deliverable_files.append(r.label)
 
     n_h = 0
     if harness_dir and Path(harness_dir).is_dir():
@@ -193,6 +211,8 @@ def build(
         failed=failed_r,
         deliverables_mode=("names" if names_only else "contents"),
         source_files=source_files,
+        deliverable_dirs=deliverable_dirs,
+        deliverable_files=deliverable_files,
         decisions=len(decisions or {}),
     )
 

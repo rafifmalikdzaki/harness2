@@ -189,6 +189,19 @@ def always_on_text(surface: SurfaceSpec, tree: Tree) -> str:
     return "\n\n".join(tree.get(a, "") for a in surface.always_on)
 
 
+def run_harness_dir(work_dir: Path | str, label: str) -> Path:
+    """Where a candidate's harness tree is inside a run directory.
+
+    The base rollouts share ONE tree -- the base harness -- so a selection
+    that awards the work to a base has no tree of its own. Looking for
+    `harnesses/base1` finds nothing, and a run that legitimately falls back
+    to the reference execution then looks like a broken run: it cannot be
+    resumed, and it records an empty fingerprint.
+    """
+    name = "base" if str(label).startswith("base") else str(label)
+    return Path(work_dir) / "harnesses" / name
+
+
 def _frontmatter(text: str, key: str) -> str:
     """A `key: value` from a file's YAML frontmatter, or ""."""
     m = re.search(rf"^{key}:\s*(.+)$", text[:800], re.M)

@@ -76,7 +76,13 @@ def harness2_run_demo(
         "--mode",
         mode,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    except subprocess.TimeoutExpired:
+        return {
+            "status": "failed",
+            "message": "the demo did not finish within 1800s",
+        }
     report_file = out / "demo.json"
     result: Dict[str, Any] = {
         "status": "success" if proc.returncode == 0 else "failed",
@@ -97,6 +103,7 @@ def harness2_run_demo(
 def harness2_inspect_library(
     domain: str = "accounting",
     runs_dir: Optional[str] = None,
+    workspace: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Inspect learned domain experiences, cues, lessons, and synthesized components.
 
@@ -106,40 +113,69 @@ def harness2_inspect_library(
     Args:
         domain: Domain name (e.g., 'accounting', 'antitrust-competition', etc.).
         runs_dir: The root runs directory (defaults to config.RUNS).
+        workspace: A repository the harness has been working in. Its
+            `.harness2/` directory is searched too, which is where the general
+            path keeps its library.
     """
-    root = Path(runs_dir).expanduser().resolve() if runs_dir else config.RUNS
-    libraries = []
-    for index_path in root.glob(f"**/library/**/{domain}/INDEX.md"):
-        domain_root = index_path.parent
-        index_content = index_path.read_text(encoding="utf-8", errors="replace")
+    from harness2.core.library import domain_dir
 
-        entries = []
-        for exp_file in domain_root.glob("harnesses/*/EXPERIENCE.md"):
-            task_name = exp_file.parent.name
-            harness_path = exp_file.parent / "harness"
-            components = [
-                str(p.relative_to(harness_path))
-                for p in harness_path.glob("**/*")
-                if p.is_file()
-            ]
-            entries.append(
+    # The domain is a NAME, not a path. It is interpolated into a glob, and
+    # `..` in it would read a directory above the library's own.
+    safe_domain = domain_dir(domain)
+    if safe_domain in (".", "..") or "/" in safe_domain:
+        return {
+            "status": "error",
+            "message": f"domain must be a name, not a path: {domain!r}",
+        }
+
+    roots: List[Path] = []
+    if runs_dir:
+        roots.append(Path(runs_dir).expanduser().resolve())
+    else:
+        roots.append(config.RUNS)
+        if workspace:
+            roots.append(Path(workspace).expanduser().resolve() / ".harness2")
+
+    libraries = []
+    seen: set = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for index_path in root.glob(f"**/library/**/{safe_domain}/INDEX.md"):
+            domain_root = index_path.parent
+            if str(domain_root) in seen:
+                continue
+            seen.add(str(domain_root))
+            index_content = index_path.read_text(encoding="utf-8", errors="replace")
+
+            entries = []
+            for exp_file in domain_root.glob("harnesses/*/EXPERIENCE.md"):
+                task_name = exp_file.parent.name
+                harness_path = exp_file.parent / "harness"
+                components = [
+                    str(p.relative_to(harness_path))
+                    for p in harness_path.glob("**/*")
+                    if p.is_file()
+                ]
+                entries.append(
+                    {
+                        "task": task_name,
+                        "experience": exp_file.read_text(encoding="utf-8", errors="replace"),
+                        "components": components,
+                        "harness_path": str(harness_path),
+                    }
+                )
+
+            libraries.append(
                 {
-                    "task": task_name,
-                    "experience": exp_file.read_text(encoding="utf-8", errors="replace"),
-                    "components": components,
-                    "harness_path": str(harness_path),
+                    "path": str(domain_root),
+                    "index": index_content,
+                    "entries": entries,
                 }
             )
 
-        libraries.append(
-            {
-                "path": str(domain_root),
-                "index": index_content,
-                "entries": entries,
-            }
-        )
-
     return {
+        "status": "ok",
         "domain": domain,
         "found_libraries": len(libraries),
         "libraries": libraries,
@@ -191,8 +227,12 @@ def harness2_apply_harness(
     chosen_format = _detect_workspace_format(dest) if format == "auto" else format.lower()
     planned_operations: List[Dict[str, Any]] = []
 
-    # Accumulate always-on instructions to avoid overwrite collision
+    # Accumulate always-on instructions to avoid overwrite collision.
+    # The RELATIVE path is kept as well as the name: the plan's "source" is
+    # used to open the file, and a name alone finds nothing when the always-on
+    # file is not at the root of the harness directory.
     always_on_contents: Dict[str, str] = {}
+    always_on_sources: Dict[str, str] = {}
 
     for root_dir, _, files in os.walk(src):
         for file in sorted(files):
@@ -201,7 +241,10 @@ def harness2_apply_harness(
             parts = rel_path.parts
 
             if rel_path.name in ("systemprompt.md", "guardrails.md", "LongTermMEMORY.md"):
-                always_on_contents[rel_path.name] = file_path.read_text(encoding="utf-8", errors="replace")
+                always_on_contents[rel_path.name] = file_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                always_on_sources[rel_path.name] = str(rel_path)
                 continue
 
             if "skills" in parts:
@@ -219,6 +262,32 @@ def harness2_apply_harness(
                 scripts_idx = parts.index("scripts")
                 subpath = Path(*parts[scripts_idx + 1 :]) if len(parts) > scripts_idx + 1 else Path(file)
                 target_file = dest / "scripts" / subpath
+            elif "sub_agents" in parts:
+                # Delegated sub-agents live in the framework's agent directory.
+                # At the workspace root nothing loads them.
+                sub_idx = parts.index("sub_agents")
+                subpath = (
+                    Path(*parts[sub_idx + 1 :]) if len(parts) > sub_idx + 1 else Path(file)
+                )
+                base = {
+                    "agy": ".gemini",
+                    "codex": ".agents",
+                    "claude": ".claude",
+                }.get(chosen_format, ".opencode")
+                target_file = dest / base / "agent" / subpath
+            elif "plugin" in parts:
+                plugin_idx = parts.index("plugin")
+                subpath = (
+                    Path(*parts[plugin_idx + 1 :])
+                    if len(parts) > plugin_idx + 1
+                    else Path(file)
+                )
+                base = {
+                    "agy": ".gemini",
+                    "codex": ".agents",
+                    "claude": ".claude",
+                }.get(chosen_format, ".opencode")
+                target_file = dest / base / "plugin" / subpath
             else:
                 target_file = dest / rel_path
 
@@ -238,7 +307,7 @@ def harness2_apply_harness(
             for name, content in always_on_contents.items():
                 tgt = dest / ".gemini" / "rules" / f"{Path(name).stem}.md"
                 planned_operations.append({
-                    "source": name,
+                    "source": always_on_sources.get(name, name),
                     "destination": str(tgt.relative_to(dest)),
                     "target_exists": tgt.is_file(),
                 })
@@ -270,7 +339,7 @@ def harness2_apply_harness(
     for op in planned_operations:
         if op["source"].startswith("combined_instructions"):
             continue
-        if op["source"] in always_on_contents and chosen_format != "agy":
+        if op["source"] in always_on_sources and chosen_format != "agy":
             continue
 
         tgt_file = dest / op["destination"]
@@ -281,6 +350,16 @@ def harness2_apply_harness(
             backups_created.append(str(bak_path.relative_to(dest)))
 
         src_file = src / op["source"]
+        if not src_file.is_file():
+            # The plan named a file that is not there. Copying on would leave
+            # the workspace half-applied with an opaque error.
+            return {
+                "status": "error",
+                "format": chosen_format,
+                "message": f"the harness source is missing a file the plan names: {op['source']}",
+                "files_written": executed_files,
+                "backups_created": backups_created,
+            }
         shutil.copy2(src_file, tgt_file)
         executed_files.append(op["destination"])
 
@@ -314,7 +393,13 @@ def harness2_apply_harness(
 
 def _rank_key(c: Dict[str, Any]) -> tuple:
     review = c.get("review") or {}
-    high = sum(1 for i in review.get("issues", []) if str(i.get("severity")).lower() == "high")
+    # A critic issue is a dict by contract, but the critic is a model: it can
+    # return a plain string, and one that did used to kill the whole tool.
+    high = sum(
+        1
+        for i in (review.get("issues") or [])
+        if isinstance(i, dict) and str(i.get("severity", "")).lower() == "high"
+    )
     score = review.get("score")
     return (
         1 if c.get("test_passed") is True else (0 if c.get("test_passed") is None else -1),
@@ -394,13 +479,39 @@ def harness2_solve(
             )
             candidates.append(_candidate_summary(label, run_dir))
         except Exception as e:  # one failing candidate must not sink the session
-            candidates.append({"label": label, "strategy": strat, "errors": [str(e)], "has_changes": False})
+            # The same shape as a candidate that ran, so a caller reading
+            # `test_passed` or `review` does not get a KeyError.
+            candidates.append(
+                {
+                    "label": label,
+                    "strategy": strat,
+                    "test_passed": None,
+                    "has_changes": False,
+                    "review": {"score": None, "issues": [], "unverified_claims": []},
+                    "claims": [],
+                    "errors": [str(e)],
+                    "worktree_path": "",
+                    "diff": "",
+                    "verification_output": "",
+                }
+            )
 
     ranked = sorted(candidates, key=_rank_key, reverse=True)
     best = ranked[0]
     (adapter.spec.runs_root / sess_id).mkdir(parents=True, exist_ok=True)
+    # The schema every reader expects: `chosen_label` and `chosen_run_id` are
+    # what `harness2_finish` and the CLI look for. `recommended` is kept
+    # because it is what this tool's own response says.
     (adapter.spec.runs_root / sess_id / "selection.json").write_text(
-        json.dumps({"recommended": best["label"], "ranking": [c["label"] for c in ranked]}, indent=2),
+        json.dumps(
+            {
+                "chosen_label": best["label"],
+                "chosen_run_id": best["label"],
+                "recommended": best["label"],
+                "ranking": [c["label"] for c in ranked],
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
@@ -410,7 +521,11 @@ def harness2_solve(
         warnings.append("No LLM configured (set INCEPTION_API_KEY in harness2/.env): no code was generated.")
     if strength != "executable":
         warnings.append(f"Verification is {strength}: a pass does not establish correctness.")
-    high = [i for i in (best.get("review") or {}).get("issues", []) if str(i.get("severity")).lower() == "high"]
+    high = [
+        i
+        for i in ((best.get("review") or {}).get("issues") or [])
+        if isinstance(i, dict) and str(i.get("severity", "")).lower() == "high"
+    ]
     if high:
         warnings.append(f"Critic found {len(high)} high-severity issue(s) in the recommended candidate.")
     if (best.get("review") or {}).get("unverified_claims"):
@@ -462,9 +577,14 @@ def harness2_finish(
         allow_destructive: Apply a patch that deletes files.
     """
     ws = Path(workspace).expanduser().resolve()
+    if not (ws / ".git").exists():
+        return {"status": "error", "message": f"{ws} is not a git repository."}
     db = MemoryDB(ws / ".harness2" / "memory.db")
     wt_root = ws / ".harness2" / "worktrees"
-    wt_mgr = WorktreeManager(ws, base_temp_dir=wt_root if wt_root.is_dir() else None)
+    try:
+        wt_mgr = WorktreeManager(ws, base_temp_dir=wt_root if wt_root.is_dir() else None)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
     session = db.get_session(session_id)
     if not session:
         return {"status": "error", "message": f"Session {session_id} not found."}
@@ -476,21 +596,43 @@ def harness2_finish(
     apply_result: Dict[str, Any] = {}
     evolution_result: Dict[str, Any] = {"status": "skipped"}
     if action == "accept":
-        labels = [r["label"] for r in session.get("rollouts", [])]
+        rollouts = session.get("rollouts", [])
+        if not rollouts:
+            return {
+                "status": "error",
+                "message": f"Session {session_id} has no rollouts to apply.",
+            }
+        # The DB records rollouts under their RUN label; the selection records
+        # the STAGE label. The run label is what a worktree is named after.
+        labels = [r["label"] for r in rollouts]
         if rollout_label:
             chosen = rollout_label
         else:
-            from harness2.adapters.general import recommended_label
+            from harness2.adapters.general import recommended_label, recommended_run_label
 
-            chosen = recommended_label(ws, session_id)
+            chosen = recommended_run_label(ws, session_id) or recommended_label(ws, session_id)
         if not chosen:
-            passed = [r for r in session.get("rollouts", []) if r.get("test_passed") == 1]
-            chosen = (passed or session.get("rollouts", [{}]))[0].get("label")
+            passed = [r for r in rollouts if r.get("test_passed") == 1]
+            chosen = (passed or rollouts)[0].get("label")
         if chosen not in labels:
-            return {"status": "error", "message": f"Unknown rollout {chosen!r}; choose from {labels}."}
+            # A stage label names a run label by its suffix.
+            match = next(
+                (
+                    lbl
+                    for lbl in labels
+                    if lbl == chosen or lbl.endswith("__" + str(chosen))
+                ),
+                None,
+            )
+            if match is None:
+                return {
+                    "status": "error",
+                    "message": f"Unknown rollout {chosen!r}; choose from {labels}.",
+                }
+            chosen = match
         try:
             worktree_path = next(
-                (r.get("worktree_path") for r in session.get("rollouts", []) if r.get("label") == chosen),
+                (r.get("worktree_path") for r in rollouts if r.get("label") == chosen),
                 None,
             )
             apply_result = wt_mgr.apply_to_repo(
@@ -521,8 +663,15 @@ def harness2_finish(
             }
         for item in learned_facts or []:
             if item.get("category") and item.get("fact"):
+                # The confidence is typed as a string, so "high" is a legal
+                # value -- and `float("high")` used to kill the tool AFTER it
+                # had already changed the repository.
+                try:
+                    confidence = float(item.get("confidence", 1.0))
+                except (TypeError, ValueError):
+                    confidence = 1.0
                 db.add_longterm_fact(
-                    item["category"], item["fact"], float(item.get("confidence", 1.0)), item.get("evidence")
+                    item["category"], item["fact"], confidence, item.get("evidence")
                 )
         evolution_result = SelfEvolutionEngine(ws, db=db).analyze_session(session_id)
         db.close_session(session_id, status="accepted", best_rollout_id=chosen)
@@ -562,6 +711,7 @@ def harness2_config_status(probe: bool = False) -> Dict[str, Any]:
     p = llm.resolve_provider()
     if p is None:
         return {
+            "status": "error",
             "configured": False,
             "hint": (
                 "Set INCEPTION_API_KEY in harness2/.env, or HARNESS2_LLM_BASE_URL, "
@@ -569,7 +719,7 @@ def harness2_config_status(probe: bool = False) -> Dict[str, Any]:
             ),
             "probed": False,
         }
-    out: Dict[str, Any] = {"configured": True, **p.public(), "probed": False}
+    out: Dict[str, Any] = {"status": "ok", "configured": True, **p.public(), "probed": False}
     if not probe:
         return out
     try:
@@ -589,7 +739,7 @@ def harness2_list_sessions(workspace: str, status: Optional[str] = None) -> Dict
     ws = Path(workspace).expanduser().resolve()
     db_file = ws / ".harness2" / "memory.db"
     if not db_file.is_file():
-        return {"sessions": []}
+        return {"status": "ok", "sessions": []}
     import sqlite3
 
     con = sqlite3.connect(str(db_file), timeout=30.0)
@@ -602,7 +752,7 @@ def harness2_list_sessions(workspace: str, status: Optional[str] = None) -> Dict
         ).fetchall()
     finally:
         con.close()
-    return {"sessions": [dict(r) for r in rows]}
+    return {"status": "ok", "sessions": [dict(r) for r in rows]}
 
 
 @server.tool()
@@ -624,6 +774,7 @@ def harness2_query_memory(
     db = MemoryDB(db_file)
     facts = db.query_longterm_memory(category)
     return {
+        "status": "ok",
         "workspace": str(ws),
         "total_facts": len(facts),
         "facts": facts,
@@ -692,7 +843,7 @@ def harness2_recursion(
         return {"status": "error", "message": "channel must be 'http' or 'opencode'."}
 
     from harness2 import config, llm
-    from harness2.adapters.general import GeneralTaskAdapter, dirty_tree_warning
+    from harness2.adapters.general import GeneralTaskAdapter
     from harness2.core.proposer import Proposer
     from harness2.core.schedule import mode_token, run_domain
     from harness2.core.spec import resolve_channel_model
@@ -775,8 +926,23 @@ def harness2_recursion(
         "runs_root": str(adapter.spec.runs_root),
         "library_root": str(library_root),
         "report": str(report),
-        "warnings": [w for w in [dirty_tree_warning(ws)] if w],
+        "sandbox": adapter.sandbox,
+        "warnings": _run_warnings(ws, sandbox, adapter),
     }
+
+
+def _run_warnings(ws: Path, sandbox_requested: bool, adapter) -> List[str]:
+    """What the caller should know about the run that the result does not say."""
+    from harness2.adapters.general import dirty_tree_warning
+
+    out = [w for w in [dirty_tree_warning(ws)] if w]
+    if sandbox_requested and not adapter.sandbox:
+        out.append(
+            "the sandbox was requested but is not available (bwrap?), so the rollouts "
+            "were NOT confined: a command in a rollout can read your home directory "
+            "and write outside the worktree."
+        )
+    return out
 
 
 
@@ -829,6 +995,10 @@ def harness2_memory_status(
     def size_of(path: Path) -> int:
         if not path.exists():
             return 0
+        # A file is a file: `rglob` on one yields nothing, so the database's
+        # size used to be reported as zero.
+        if path.is_file():
+            return path.stat().st_size
         return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
     before = {
@@ -875,8 +1045,18 @@ def harness2_benchmark_status(
         "--substrate",
         substrate,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return {
+            "status": "error",
+            "bench": bench,
+            "substrate": substrate,
+            "ready": False,
+            "output": "the benchmark check did not finish within 300s",
+        }
     return {
+        "status": "ok" if proc.returncode == 0 else "error",
         "bench": bench,
         "substrate": substrate,
         "ready": proc.returncode == 0,
