@@ -141,7 +141,7 @@ def main(argv=None) -> int:
             f"    {stats.get('files_changed', 0)} file(s) changed: "
             f"+{stats.get('bytes_added', 0):,} / -{stats.get('bytes_removed', 0):,} bytes"
         )
-        print("    The change is staged. Review it with `git diff --cached`, then commit.")
+        print("    The change is in the working tree, unstaged. Review it with `git diff`.")
         db.close_session(args.session_id, status="accepted")
     else:
         db.close_session(args.session_id, status="discarded")

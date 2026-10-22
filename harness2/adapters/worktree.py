@@ -324,19 +324,60 @@ class WorktreeManager:
                 "patch_bytes": len(patch),
             }
 
-        apply_res = subprocess.run(
-            ["git", "apply", "--3way"],
+        # A plain apply touches the WORKING TREE only, and leaves the
+        # operator's index alone. `git apply --3way` implies `--index`, so it
+        # both staged the result and REFUSED to run at all when the index
+        # held anything -- which is the common state in a real repository.
+        plain = subprocess.run(
+            ["git", "apply", "--whitespace=nowarn"],
             cwd=self.repo_root,
             input=patch,
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT,
         )
-        if apply_res.returncode != 0:
-            raise WorktreeError(f"Failed to apply patch to repository:\n{apply_res.stderr}")
+        if plain.returncode == 0:
+            return {
+                "applied": True,
+                "reason": "",
+                "stats": stats.to_dict(),
+                "patch_bytes": len(patch),
+                "staged": False,
+            }
+
+        # The context did not match. The three-way merge can still resolve
+        # it, and it needs a clean index for the paths it touches -- which
+        # the plain apply's failure suggests is the case here.
+        three_way = subprocess.run(
+            ["git", "apply", "--3way", "--whitespace=nowarn"],
+            cwd=self.repo_root,
+            input=patch,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT,
+        )
+        if three_way.returncode != 0:
+            raise WorktreeError(
+                "Failed to apply patch to repository:\n"
+                + (three_way.stderr or plain.stderr or "").strip()
+            )
+        # The three-way apply staged the result. The index was clean for
+        # these paths (otherwise it would have refused), so unstaging them
+        # restores the state the operator started from.
+        touched = [p for p in list(stats.added) + list(stats.modified) + list(stats.deleted) if p]
+        if touched:
+            subprocess.run(
+                ["git", "reset", "-q", "--", *touched],
+                cwd=self.repo_root,
+                capture_output=True,
+                text=True,
+                timeout=_GIT_TIMEOUT,
+            )
         return {
             "applied": True,
             "reason": "",
             "stats": stats.to_dict(),
             "patch_bytes": len(patch),
+            "staged": False,
+            "three_way": True,
         }

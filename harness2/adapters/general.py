@@ -26,7 +26,7 @@ from .. import llm
 from ..core import runmark, tree
 from ..core.compress import read_text
 from ..core.memory_db import MemoryDB
-from ..core.spec import BenchPrompts, BenchSpec, ChannelSpec
+from ..core.spec import BenchPrompts, BenchSpec, resolve_channel_model
 from ..substrate.base import Install, RunRequest
 from ..substrate.opencode import OpencodeSubstrate
 from . import agent
@@ -323,7 +323,11 @@ class GeneralTaskAdapter:
             if runs_root
             else self.harness_dir / "runs"
         )
-        channel = ChannelSpec(self.channel, self.selector_model)
+        # The channel spec goes through the ONE resolver, so the model-id
+        # rules are the same here as everywhere else. Building the spec
+        # directly let an empty model through, and the failure surfaced much
+        # later as "Model unavailable".
+        channel = resolve_channel_model(self.channel, self.selector_model or None)
         self.spec = BenchSpec(
             name="general",
             runs_root=actual_runs_root,

@@ -688,8 +688,8 @@ def harness2_finish(
         "deleted_worktrees": cleaned,
         "self_evolution": evolution_result,
         "note": (
-            "The change is staged in the working tree. Review it with "
-            "`git diff --cached` and commit it yourself."
+            "The change is in the working tree, unstaged, and your index is untouched. "
+            "Review it with `git diff` and commit it yourself."
         ),
     }
 

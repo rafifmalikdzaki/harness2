@@ -66,20 +66,31 @@ def read_text(path: Path | str) -> str:
     """Read text, decompressing it when the name says so.
 
     A plain file is read as-is, so a directory written before compression
-    was added still reads.
+    was added still reads. A file whose COMPRESSED copy is missing falls
+    back to the plain one, and the other way round: `copy_compressed`
+    writes the compressed copy beside the plain name, and a caller that
+    read the plain name found nothing -- indistinguishable from "there was
+    no file".
     """
     path = Path(path)
-    if not path.is_file():
-        return ""
-    if path.name.endswith(".gz"):
+    if path.is_file():
+        if path.name.endswith(".gz"):
+            try:
+                return decompress_text(path.read_bytes())
+            except (OSError, EOFError, zlib.error):
+                # A gzip file with a valid header and a corrupt payload raises
+                # zlib.error, which is not an OSError: it used to escape and
+                # take the reader with it.
+                return ""
+        return path.read_text(encoding="utf-8", errors="replace")
+    # The compressed sibling.
+    sibling = path.with_suffix(path.suffix + ".gz")
+    if sibling.is_file():
         try:
-            return decompress_text(path.read_bytes())
+            return decompress_text(sibling.read_bytes())
         except (OSError, EOFError, zlib.error):
-            # A gzip file with a valid header and a corrupt payload raises
-            # zlib.error, which is not an OSError: it used to escape and take
-            # the reader with it.
             return ""
-    return path.read_text(encoding="utf-8", errors="replace")
+    return ""
 
 
 def copy_compressed(src: Path | str, dst: Path | str) -> Path | None:
@@ -87,6 +98,11 @@ def copy_compressed(src: Path | str, dst: Path | str) -> Path | None:
 
     Transcripts compress by roughly an order of magnitude; a small diff
     does not, and stays readable.
+
+    The returned path is where the copy landed, which is NOT always `dst`:
+    a file big enough to be worth compressing lands at `dst + ".gz"`. A
+    caller that ignored the return value and read `dst` found nothing, and
+    could not tell that from "there was no file".
     """
     src, dst = Path(src), Path(dst)
     if not src.is_file():
