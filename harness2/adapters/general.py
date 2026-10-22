@@ -19,7 +19,6 @@ import hashlib
 import json
 import shutil
 import subprocess
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -32,11 +31,19 @@ from ..substrate.base import Install, RunRequest
 from ..substrate.opencode import OpencodeSubstrate
 from . import agent
 from .diffguard import analyze_patch
-from .general_runner import run_opencode_in_workspace, stage_harness
+from .general_runner import run_opencode_in_workspace
 from .sandbox import sandbox_available
 from .worktree import WorktreeManager
 
-__all__ = ["GeneralTaskAdapter", "candidate_rows", "render_candidate_table"]
+__all__ = [
+    "GeneralTaskAdapter",
+    "candidate_rows",
+    "render_candidate_table",
+    "recommended_label",
+    "recommended_run_label",
+    "selection_file",
+    "dirty_tree_warning",
+]
 
 
 # The source room the improver reads: the repository's tracked text files,
@@ -371,18 +378,6 @@ class GeneralTaskAdapter:
             out[rel] = src.read_text(encoding="utf-8", errors="replace")
         return out
 
-    def _render_ctx(self) -> dict:
-        """Template slots for the harness body, describing this repository."""
-        return {
-            "env_description": (
-                "A git working copy of the user's own repository. Edit files in place; "
-                "the working tree is a disposable sandbox and only your changes are kept."
-            ),
-            "domain_focus": self.domain,
-            "date": datetime.now(timezone.utc).date().isoformat(),
-            "working_directory": "the repository root; edit files in place",
-        }
-
     # ------------------------------------------------------------------
     # protocol
     # ------------------------------------------------------------------
@@ -498,40 +493,6 @@ class GeneralTaskAdapter:
         if venv.is_dir():
             pairs.append((venv, worktree / ".venv"))
         return pairs
-
-    def _launcher(self, worktree: Path, timeout: int):
-        """A launcher bound to one worktree, so concurrent rollouts stay isolated."""
-
-        def launch(req: RunRequest, install: Install) -> list[Path]:
-            authored = stage_harness(install.staging_dir, worktree, self._render_ctx())
-            # The sandbox mounts the project's virtualenv at the path a
-            # worktree expects to find it, and bwrap creates that mount
-            # point on the real filesystem. It is scaffolding, like the
-            # harness files, so it must not read as the agent's work.
-            venv = worktree / ".venv"
-            if venv.is_dir():
-                authored.append(".venv")
-            (worktree / ".harness_authored").write_text(
-                "\n".join(sorted(authored)), encoding="utf-8"
-            )
-
-            rollout = run_opencode_in_workspace(
-                workspace=worktree,
-                prompt=self.task_prompt(req.task_ref),
-                model=self.model,
-                title=f"general | {req.task_ref}",
-                timeout=timeout,
-                allow_mcp=self.allow_mcp,
-                sandbox=self.sandbox,
-                # The project's own checkout, read-only: the rollout needs
-                # its virtualenv and its installed tooling to run the
-                # project's tests. Writing to the checkout is what the
-                # sandbox forbids -- the worktree is where changes go.
-                sandbox_readonly=self._sandbox_readonly(worktree),
-            )
-            return [rollout.trajectory.parent]
-
-        return launch
 
     def _render_harness(self, harness_dir: Optional[Path]) -> tuple[str, Dict[str, object]]:
         """The improver's harness as text, plus a record of what it contained.

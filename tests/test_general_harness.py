@@ -13,7 +13,6 @@ from pathlib import Path
 import pytest
 
 from harness2.adapters.general import GeneralTaskAdapter
-from harness2.adapters.general_runner import stage_harness
 from harness2.core import tree
 
 
@@ -109,7 +108,13 @@ def test_internal_state_is_gitignored(tmp_path):
 # ---------------------------------------------------------------- staging
 
 
-def test_stage_harness_places_files_where_opencode_loads_them(tmp_path):
+def test_the_harness_is_staged_without_clobbering_the_project(tmp_path):
+    """The harness goes where it cannot overwrite the project's own files.
+
+    A project already has `scripts/` and `AGENTS.md` of its own. The harness's
+    copies live under `.harness_staged/`, and `AGENTS.md` is written at the
+    root only when the project does not have one.
+    """
     adapter = make_adapter(tmp_path)
     surface = adapter.substrate.surface()
     staged = tmp_path / "staged"
@@ -133,16 +138,31 @@ def test_stage_harness_places_files_where_opencode_loads_them(tmp_path):
 
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    authored = stage_harness(staged, workspace, adapter._render_ctx())
+    authored = adapter._stage_harness(staged, workspace)
 
+    assert (workspace / ".harness_staged" / "scripts" / "helper.py").is_file()
+    assert (workspace / ".harness_staged" / "skills" / "review" / "SKILL.md").is_file()
+    # The always-on prose is what the agent framework loads.
     assert (workspace / "AGENTS.md").is_file()
     assert "Do the thing." in (workspace / "AGENTS.md").read_text(encoding="utf-8")
-    assert (workspace / "scripts" / "helper.py").is_file()
-    assert (workspace / ".opencode" / "skills" / "review" / "SKILL.md").is_file()
-    assert not (workspace / ".harness_render").exists()
+    # And the project's own directories are untouched.
+    assert not (workspace / "scripts").exists()
+    assert ".harness_staged/scripts/helper.py" in authored
     assert "AGENTS.md" in authored
-    assert "scripts/helper.py" in authored
-    assert ".opencode/skills/review/SKILL.md" in authored
+
+
+def test_a_project_with_its_own_agents_md_keeps_it(tmp_path):
+    repo = make_repo(tmp_path)
+    (repo / "AGENTS.md").write_text("# the project's own rules\n", encoding="utf-8")
+    adapter = GeneralTaskAdapter(repo_root=repo, goal="x", model="p/m")
+    surface = adapter.substrate.surface()
+    staged = tmp_path / "staged"
+    tree.write_tree(surface, {"systemprompt.md": "Do the thing.\n"}, staged, stubs=False)
+
+    wt = adapter.wt_mgr.create(adapter.session_id, "probe_1")
+    (wt / "AGENTS.md").write_text("# the project's own rules\n", encoding="utf-8")
+    adapter._stage_harness(staged, wt)
+    assert (wt / "AGENTS.md").read_text(encoding="utf-8") == "# the project's own rules\n"
 
 
 def test_harness_files_stay_out_of_the_deliverable(tmp_path):
@@ -151,7 +171,6 @@ def test_harness_files_stay_out_of_the_deliverable(tmp_path):
     adapter = GeneralTaskAdapter(repo_root=repo, goal="x", model="p/m")
     wt = adapter.wt_mgr.create(adapter.session_id, "probe_1")
 
-    # The launcher stages the harness into the worktree...
     surface = adapter.substrate.surface()
     staged = tmp_path / "staged"
     tree.write_tree(
@@ -167,7 +186,7 @@ def test_harness_files_stay_out_of_the_deliverable(tmp_path):
     )
     (staged / "scripts").mkdir(exist_ok=True)
     (staged / "scripts" / "helper.py").write_text("print('h')\n", encoding="utf-8")
-    authored = stage_harness(staged, wt, adapter._render_ctx())
+    authored = adapter._stage_harness(staged, wt)
 
     # ...and the agent changes something of its own.
     (wt / "app.py").write_text("print('v2')\n", encoding="utf-8")
