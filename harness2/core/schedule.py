@@ -101,12 +101,6 @@ class Namespace:
     def task_dir(self, root: Path, task_id: str) -> Path:
         return Path(root) / str(self) / task_id.replace("/", "__")
 
-    @classmethod
-    def glob(cls, benchmark: str, substrate: str, k: int, *, mode: str = "*") -> tuple[str, str]:
-        """The only glob over namespaces; both patterns match seeded, tagged and bare forms."""
-        base = f"{benchmark}-{substrate}-{mode}{int(k)}"
-        return base, f"{base}-*"
-
 
 def ns(
     benchmark: str, substrate: str, mode: str, k: int, *, seed: int | None = None, tag: str = ""

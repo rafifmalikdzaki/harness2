@@ -68,16 +68,6 @@ def env(name: str, default=None):
     return os.environ.get(name) or default
 
 
-def env_int(name: str, default: int) -> int:
-    v = env(name)
-    if v is None:
-        return int(default)
-    try:
-        return int(v)
-    except ValueError as e:
-        raise ConfigError(f"{name} must be an integer, got {v!r}") from e
-
-
 def require(name: str, *, needed_by: str) -> str:
     """The value of `name`, or ConfigError with the remediation line when it is unset/empty."""
     v = env(name)
