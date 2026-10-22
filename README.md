@@ -129,18 +129,31 @@ Python executions. It requires no model credentials.
 For model-backed runs, configure your API keys in `.env`:
 ```bash
 cp .env.example .env
-
-# Configure whichever LLM providers you use:
-# 1. Inception Labs (fast & efficient code reasoning)
-export INCEPTION_API_KEY="your-inception-key"
-export HARNESS2_SOLVER_MODEL="inception/mercury-3"
-export HARNESS2_IMPROVER_MODEL="inception/mercury-3"
-
-# 2. OpenAI / Anthropic / Gemini
-export OPENAI_API_KEY="your-openai-key"
-export ANTHROPIC_API_KEY="your-anthropic-key"
-export GEMINI_API_KEY="your-gemini-key"
 ```
+
+```bash
+# 1. Inception Labs (fast & efficient code reasoning) -- the simplest setup:
+#    the solver, the improver and the selector all use it.
+export INCEPTION_API_KEY="your-inception-key"
+
+# 2. Any OpenAI-compatible endpoint
+export HARNESS2_LLM_BASE_URL="https://api.example.com/v1"
+export HARNESS2_LLM_API_KEY="your-key"
+export HARNESS2_LLM_MODEL="some-model"
+
+# 3. The OpenCode CLI channel (optional -- the default needs neither of these)
+export HARNESS2_SOLVER_MODEL="anthropic/claude-sonnet-4-5"
+export HARNESS2_IMPROVER_MODEL="anthropic/claude-sonnet-4-5"
+```
+
+Then check the machine can run it:
+
+```bash
+harness2-doctor --workspace ~/my-project
+```
+
+See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for what each failure
+looks like and what to do about it.
 
 ---
 
@@ -178,22 +191,62 @@ harness2-general --workspace ~/my-project \
   --k 2 --mode parallel
 ```
 
+### One API key is enough
+
+The solver, the improver and the selector all run on the same model service by
+default. Put your key in `.env` and the whole loop runs:
+
+```bash
+cp .env.example .env
+echo 'INCEPTION_API_KEY=sk-...' >> .env
+harness2-doctor --workspace ~/my-project   # checks this machine can run it
+```
+
+`harness2-doctor` is the first thing to run when something does not work: it
+checks the provider, git, a real worktree round trip, the sandbox, the state
+directory, and tells you what to fix.
+
 ### CLI Parameters
 
 | Flag | Default | Description |
 |---|---|---|
 | `--workspace` | *(required)* | Path to the target git repository. |
 | `--goal` | *(required)* | Clear instruction of what the agent should accomplish. |
-| `--verify` | `None` | Shell command run inside the sandbox to verify candidate correctness (e.g. `pytest -q`, `npm test`, `cargo test`). |
-| `--k` | `2` | Number of candidate strategies to generate and evaluate. |
-| `--mode` | `parallel` | `parallel` (probes $k$ candidates and composes evidence) or `sequential` (successive refinement). |
-| `--model` | `HARNESS2_SOLVER_MODEL` | LLM used to write code changes (e.g. `inception/mercury-3`, `openai/gpt-4o`). |
-| `--improver-model` | `HARNESS2_IMPROVER_MODEL` | LLM used for candidate proposal and independent critic auditing. |
+| `--verify` | `None` | Shell command run inside the worktree to verify candidate correctness (e.g. `pytest -q`, `npm test`). Its **exit status** is the verdict. |
+| `--k` | `2` | Recursion budget: $4k$ rollouts and $3k$ improver sessions per mode. |
+| `--mode` | `parallel` | `parallel` (probes $k$ candidates and composes the evidence) or `sequential` (successive refinement), or `both`. |
+| `--channel` | `http` | How the improver and the selector run. `http` uses the same model service as the solver; `opencode` uses the OpenCode CLI and needs `HARNESS2_IMPROVER_MODEL`. |
+| `--runtime` | `http` | How the *rollout's* solver runs. `http` is a model call that writes files; `opencode` is a real agent session under the OpenCode CLI. |
+| `--model` | `HARNESS2_SOLVER_MODEL` | The rollout's model, for `--runtime opencode`. |
+| `--improver-model` | the provider's model | The proposer's and selector's model. |
 | `--timeout` | `1800` | Timeout per candidate execution in seconds. |
+| `--progress` | `human` | `human` (a line per stage on stderr), `json` (JSONL), or `none`. |
+| `--dry-run` | `False` | Print the budget, the models and where the artifacts will go, and stop. |
 | `--no-sandbox` | `False` | Disables Bubblewrap (`bwrap`) isolation if running in environments where unprivileged user namespaces are disabled. |
 
+### The harness reaches the solver
+
+This is the part that makes the loop worth running. The improver's proposal is
+not decoration: its text becomes the **operating instructions** the solver
+works under, and its scripts are staged into the worktree so they can be run.
+A candidate whose harness differs from another's therefore behaves
+differently, which is the only reason to run both.
+
+Every candidate records the harness it ran:
+
+```json
+{"harness": {"applied": true, "files": 5, "chars": 824, "digest": "999461ed0910"}}
+```
+
 ### Zero Branch Clutter (Detached Sandboxes)
-Harness² runs all candidate probes inside detached git worktrees at `.harness2/worktrees/`. **Zero branches are created in `git branch`**, leaving your active branch and working directory untouched. When the run finishes, temporary worktrees are automatically pruned.
+Harness² runs all candidate probes inside detached git worktrees at `.harness2/worktrees/`. **Zero branches are created in `git branch`**, leaving your active branch and working directory untouched. The worktrees are removed when you accept or discard a session.
+
+### Applying a candidate is guarded
+
+`harness2-finish` reads the candidate's patch before it applies it. A patch
+that **deletes files** is refused with the list of what it would remove: a
+verification command that exited 0 does not make removing 151 of your files
+safe. Pass `--allow-destructive` to apply it anyway.
 
 ### Keeping the memory bounded
 
@@ -207,7 +260,7 @@ Transcripts are stored compressed, the record's large fields are
 compressed, library entries a newer entry supersedes are retired, and a
 retention policy keeps the recent runs in full while older runs keep their
 conclusions and lose their transcripts. The policy runs at the end of every
-general run, and can be inspected or applied directly via `harness2_query_memory`.
+general run, and can be inspected or applied directly via `harness2_memory_status`.
 
 **[docs/FINDINGS.md](docs/FINDINGS.md)** records every bottleneck this
 harness hit — the disk blow-up, the isolation escapes, the runtime
@@ -338,20 +391,27 @@ Add to `~/.gemini/config/mcp_config.json`:
 
 ---
 
-### MCP Tools Reference (8 Exposed Tools)
+### MCP Tools Reference (11 Exposed Tools)
 
-The Harness² MCP server exposes 8 production-ready tools for IDEs and autonomous agents:
+The Harness² MCP server exposes 11 production-ready tools for IDEs and autonomous agents:
 
 | Tool | Parameters | Description |
 |---|---|---|
-| `harness2_solve` | `goal`, `workspace`, `verify_cmd`, `domain`, `k`, `mode`, `timeout` | **Main task solver:** Spawns divergent candidate rollouts (`minimal`, `skeptical`, `thorough`) in isolated git worktrees, verifies with tests, audits with an independent critic, and selects the winning rollout without modifying your repository. |
-| `harness2_finish` | `session_id`, `action` (`accept` or `discard`), `workspace`, `rollout_label` | **Lifecycle finalizer:** `accept` applies the candidate's diff cleanly to your main tree and saves learned facts/skills; `discard` cleans up temporary sandboxes and reverts state. |
-| `harness2_query_memory` | `workspace`, `category`, `limit` | **Institutional memory query:** Reads structured facts, session histories, lessons, and project conventions from SQLite (`.harness2/memory.db`). |
-| `harness2_apply_harness` | `harness_path`, `target_workspace`, `dry_run`, `backup` | **Harness materialization:** Installs synthesized guardrails and skills into active workspaces with single-pass collision-free merge and `.bak` protection. |
-| `harness2_inspect_library` | `domain`, `workspace` | **Experience library reader:** Inspects synthesized domain cues, heuristics, and reusable scripts from `.harness2/library/`. |
-| `harness2_list_sessions` | `workspace`, `limit` | **Session auditor:** Lists active and recent task sessions, showing candidate scores, test pass/fail states, and chosen winners. |
-| `harness2_config_status` | *(none)* | **Environment diagnostic:** Verifies configured API keys (Inception, OpenAI, Anthropic, Gemini), active models, and toolchain readiness. |
-| `harness2_run_demo` | `k`, `mode` | **Offline verification:** Runs deterministic offline Propose-Probe-Compose recursion without external API calls. |
+| `harness2_recursion` | `goal`, `workspace`, `k`, `mode`, `domain`, `verify_cmd`, `timeout`, `sandbox`, `allow_mcp`, `channel`, `improver_model` | **The real Propose–Probe–Compose loop.** An improver proposes harness edits, each candidate is probed in an isolated worktree with that harness as its operating instructions, the contrasts are composed into a refined harness, and a selector picks the winner by reading the candidates — no ground-truth judge required. |
+| `harness2_solve` | `goal`, `workspace`, `verify_cmd`, `domain`, `k`, `repair_rounds`, `context_files`, `timeout` | **Main task solver:** Spawns divergent candidate rollouts (`minimal`, `skeptical`, `thorough`) in isolated git worktrees, verifies with tests, audits with an independent critic, and ranks the candidates. Nothing touches your working tree until `harness2_finish(action='accept')`. |
+| `harness2_finish` | `session_id`, `workspace`, `action` (`accept` or `discard`), `rollout_label`, `learned_facts`, `keep_worktrees`, `allow_destructive` | **Lifecycle finalizer:** `accept` applies the recommended candidate's diff to your tree and records learned facts; `discard` closes the session and removes the worktrees. A candidate whose diff *deletes files* is refused unless `allow_destructive` is set. |
+| `harness2_query_memory` | `workspace`, `category` | **Institutional memory query:** Reads structured facts and lessons from SQLite (`.harness2/memory.db`) and renders them as markdown. |
+| `harness2_apply_harness` | `harness_path`, `target_workspace`, `format`, `dry_run`, `backup` | **Harness materialization:** Installs synthesized guardrails and skills into active workspaces with single-pass collision-free merge and `.bak` protection. |
+| `harness2_inspect_library` | `domain`, `runs_dir` | **Experience library reader:** Inspects synthesized domain cues, heuristics, and reusable scripts from `.harness2/library/`. |
+| `harness2_list_sessions` | `workspace`, `status` | **Session auditor:** Lists sessions with their goal, status and chosen winner. |
+| `harness2_config_status` | `probe` | **Environment diagnostic:** Reports the provider and model the server will use. `probe=true` makes one live call to confirm the endpoint answers — by default it does not spend anything. |
+| `harness2_memory_status` | `workspace`, `prune`, `keep_evidence_runs`, `keep_transcript_runs`, `keep_runs`, `max_age_days` | **Memory policy:** Reports how much disk the harness's memory uses, and optionally applies the retention policy. |
+| `harness2_run_demo` | `k`, `mode`, `output_dir` | **Offline verification:** Runs deterministic offline Propose-Probe-Compose recursion without external API calls. |
+| `harness2_benchmark_status` | `bench`, `substrate` | **Benchmark readiness:** Runs the install checks for one benchmark and reports whether it is ready. |
+
+> `harness2_recursion` is the flagship: it runs the actual recursive loop.
+> `harness2_solve` is the cheaper, scripted path — candidates with different
+> strategies, but no harness proposal.
 
 ---
 
@@ -388,7 +448,7 @@ Harness² features a dual-layer institutional memory engine:
 
 2. **Self-Evolution & Procedural Skills (`.harness2/skills/`):**
    * When winning solutions introduce reusable procedures or scripts, Harness² self-evolves by saving modular skill files into `.harness2/skills/`.
-   * Future agent sessions can inspect and invoke these skills directly.
+   * Those skills are folded into the base harness the **next** run starts from, so a procedure that worked once is available the next time — and it is loaded on demand, not paid for on every run.
 
 ---
 
@@ -403,14 +463,37 @@ Language models have bounded output token limits. Asking an LLM to generate 5 co
 * **$k=2$ (Balanced):** Compares contrasting strategies (`minimal` vs `skeptical`) with independent verification (~3–4 minutes).
 * **$k=4$ (Deep):** Comprehensive search for non-trivial architectural problems.
 
-### 3. Real-Time Run Monitoring
-When running long tasks in the background:
-```bash
-# Check running sessions and candidate states
-harness2-mcp  # or inspect via harness2_list_sessions
+### 3. Watch a run as it goes
 
-# Tail the latest candidate output
+A run is tens of minutes of model calls, so `harness2-general` prints a line
+per stage and per rollout as it happens. Nothing has to be polled:
+
+```
+18:54:46  stage  1/3  dom1   kept-base      0.8s  $0.0000
+18:54:52  stage  2/3  inv1   ok             6.6s  $0.0000
+18:54:54  rollout 1/4 dom1   delivered      1.9s
+18:54:57  stage  3/3  agg1   kept-base      3.1s  $0.0000
+```
+
+`--progress json` emits the same events as JSONL, and `--progress none`
+silences them. The run also ends with a table of the candidates:
+
+```
+candidate      strategy   verify  critic  files    +bytes    -bytes
+-------------------------------------------------------------------
+agg1           minimal    PASS    10/10       1        27         0
+base1          minimal    PASS    10/10       1        27         0
+inv1           minimal    PASS    10/10       1        27         0
+```
+
+To watch the artifacts of a run that is already going:
+
+```bash
+# What is running, and where
 watch -n 2 "ls -lt .harness2/runs/ | head -n 10"
+
+# The audit trail: every mission, every reply, every harness that came back
+ls .harness2/audit/
 ```
 
 ## Experiments

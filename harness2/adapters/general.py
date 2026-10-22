@@ -292,8 +292,30 @@ class GeneralTaskAdapter:
         # c1: the task goal.
         base_components["systemprompt.md"] = f"Task Goal:\n{self.goal}\n"
 
+        # The skills the self-evolution engine synthesized out of earlier
+        # verified runs. They are only worth writing if a later run can load
+        # them, so they go into the harness the next run starts from.
+        for rel, body in self._synthesized_skills(surface).items():
+            base_components[rel] = body
+
         tree.write_tree(surface, base_components, base_dir, stubs=False)
         return base_dir
+
+    def _synthesized_skills(self, surface) -> Dict[str, str]:
+        """The skills the self-evolution engine wrote, as harness-tree entries."""
+        out: Dict[str, str] = {}
+        skills_root = self.harness_dir / "skills"
+        if not skills_root.is_dir():
+            return out
+        for d in sorted(skills_root.iterdir()):
+            if not d.is_dir():
+                continue
+            src = d / "SKILL.md"
+            rel = f"{surface.skill_dir}/{d.name}/SKILL.md"
+            if not src.is_file() or not tree.is_allowed(surface, rel):
+                continue
+            out[rel] = src.read_text(encoding="utf-8", errors="replace")
+        return out
 
     def _render_ctx(self) -> dict:
         """Template slots for the harness body, describing this repository."""

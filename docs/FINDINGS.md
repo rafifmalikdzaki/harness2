@@ -24,11 +24,181 @@ Status is one of:
 | C. Memory and disk | 6 | 5 | 1 | 0 |
 | D. The runtime | 6 | 6 | 0 | 0 |
 | E. Evidence and grading | 5 | 5 | 0 | 0 |
+| F. The second round | 11 | 11 | 0 | 0 |
 
 The two that mattered most were **F-17** (the evidence tree copied the
 repository, and then itself, until the disk was full) and **F-11** (the
 proposer was unsandboxed, so its relative writes landed in whatever
 directory the harness had been launched from).
+
+---
+
+## F. The second round
+
+Round one was measured against a harness whose general path never ran. Once it
+ran, a second set of problems showed up — most of them in the seam between
+"the improver proposed something" and "the solver did something with it".
+
+**These are the findings that mattered.** F-34 is the one that made the whole
+loop vacuous.
+
+### F-34 — the proposed harness never reached the solver
+
+**Measurement.** `GeneralTaskAdapter.execute()` took a `harness_dir` argument
+and never used it. The improver's proposal was written to
+`runs/<session>/harnesses/<label>/` and stopped there. The solver was called
+with the goal, a strategy and the project's files — never with the harness.
+
+**Evidence.** In a real run, `inv1` proposed a 1361-byte `guardrails.md` that
+named the exact verification command the agent had to run. The rollout's diff
+was indistinguishable from `base1`'s. Every candidate ran identical
+instructions; the only thing that varied between them was the strategy string
+and the luck of the draw.
+
+**Root cause.** A rewrite of the solver path (`47b7c19`) replaced the
+substrate-driven rollout with a direct model call and dropped the harness
+staging on the way. Nothing failed: the proposal was still written, still
+validated, still recorded as a candidate's harness. The loop looked busy and
+measured nothing.
+
+**Solution.** `execute()` now renders the harness into text
+(`core/tree.py: render_harness_text`), places it **above** the goal in the
+solver's prompt, and stages its scripts into the worktree. Each candidate
+records the harness it ran, so a run can be audited after the fact.
+**Fixed** — `harness2/adapters/general.py`, `harness2/adapters/agent.py`.
+
+### F-35 — a tripwire for benchmarks aborted every general run
+
+**Measurement.** Two consecutive runs of the general path on a research
+repository ended `status: "partial"` with `selections: {}` — no deliverable at
+all. The error was:
+
+```
+grader verdict would enter model context: 'source/scripts/audit_expanded_goal.py'
+contains marker '"passed_count"' at offset 912
+```
+
+and, on the second run, the same marker in the candidate's own diff, which the
+evidence tree had copied into `pool/<label>/produced.md`.
+
+**Root cause.** The tripwire exists so a benchmark's grader output never
+reaches the model. On a general task there is no grader, the verifier's output
+*is* the evidence, and the evidence is the user's own repository — in which
+`"passed_count"` is an ordinary JSON key.
+
+**Solution.** `BenchSpec` now carries the markers and the policy. Benchmarks
+keep the full set and abort; the general path declares none and quarantines a
+hit instead of aborting. **Fixed** — `harness2/core/context.py`,
+`harness2/core/spec.py`.
+
+### F-36 — a candidate deleted 151 of the project's files, and passed
+
+**Measurement.** One candidate's diff was 1.35 MB: 153 files changed, **151
+deletions**. Its verifier exited 0. `apply_to_repo` would have applied it to
+the user's working tree.
+
+**Root cause.** The agent ran git commands against the repository it was
+working in. Nothing in the harness read the patch before applying it, and a
+passing verifier was treated as a safety argument.
+
+**Solution.** `adapters/diffguard.py` reads the patch: files added, modified,
+**deleted**, bytes removed. `apply_to_repo` refuses a destructive patch and
+says exactly what it would remove; `--allow-destructive` overrides. The guard
+is independent of the verifier's verdict. **Fixed** —
+`harness2/adapters/worktree.py`.
+
+### F-37 — an apply that did nothing reported that it had applied something
+
+**Measurement.** `git add` and `git diff --cached` were run without checking
+their return codes. Either failing produced an empty patch, which the code
+treated as "nothing to apply" — and returned success. The caller reported
+`applied_to_repository: true` and the changes were gone.
+
+**Solution.** Every git step is checked, and the outcome distinguishes "no
+changes" from "applied". **Fixed** — `harness2/adapters/worktree.py`.
+
+### F-38 — `harness2-finish` cleaned the wrong directory and applied the wrong rollout
+
+**Measurement.** It created a `WorktreeManager` with the default temp root
+(`/tmp/harness2_worktrees`) while the worktrees live in
+`<workspace>/.harness2/worktrees`. It reported "Cleaned and deleted 0
+worktrees" and left every one behind, with its `git worktree` registration.
+It also applied the **last** rollout rather than the recommended one.
+
+**Solution.** The command looks where the worktrees are, reads the
+recommendation out of `selection.json`, and takes `--label` for an override.
+**Fixed** — `harness2/cli/finish.py`.
+
+### F-39 — every general rollout was graded as failed
+
+**Measurement.** `GeneralTaskAdapter._verdicts` was declared and never
+written. `score()` therefore always returned `n_passed: 0`, and every
+candidate was a failure.
+
+**Solution.** The verdict is recorded as the rollout runs and read back out of
+the artifact, so a judge in another process sees the same one. A candidate
+whose command never ran is ungraded, not a zero. **Fixed** —
+`harness2/adapters/general.py`.
+
+### F-40 — one API key could not run the loop
+
+**Measurement.** The solver ran on one provider (an OpenAI-compatible HTTP
+client) and the improver on another (the OpenCode CLI, needing a
+provider-prefixed model id). The README documented neither. On a machine with
+only `INCEPTION_API_KEY` set, the improver could not run at all.
+
+**Solution.** The `http` channel: the improver and the selector run on the
+same model service as the solver, and one key runs the whole loop. The
+OpenCode channel stays available. **Fixed** — `harness2/core/proposer.py`,
+`harness2/core/spec.py`.
+
+### F-41 — a run that takes minutes looked like a hung process
+
+**Measurement.** Nothing was printed between the start of a run and the end.
+A $k=2$ run in both modes is tens of minutes of model calls with a blank
+terminal, so runs were started in the background and guessed at.
+
+**Solution.** `core/progress.py` prints a line per stage and per rollout, with
+elapsed time and spend; JSONL and silent modes too. `--dry-run` prints the
+budget before any of it is spent, and the run ends with a table of the
+candidates. **Fixed** — `harness2/core/progress.py`, `harness2/cli/general.py`.
+
+### F-42 — the tests made paid calls with the repository's contents
+
+**Measurement.** `tests/test_general_end_to_end.py` claimed to be offline. It
+was not: the production path called `llm.chat`, so the suite posted the temp
+repository's file contents to a third-party API and billed for it. There was
+no `conftest.py`.
+
+**Solution.** `tests/conftest.py` makes every model call fail loudly and
+blocks the agent runtimes. The end-to-end test is hermetic and asserts the
+thing that matters — that the harness reaches the solver. **Fixed** —
+`tests/conftest.py`.
+
+### F-43 — the documentation described a harness that did not exist
+
+**Measurement.** The README said the MCP server exposed 8 tools; it exposed
+11. The flagship one, `harness2_recursion`, was not in the table. Several
+signatures were wrong. `docs/FINDINGS.md` marked four findings as fixed that
+`47b7c19` had reverted. `.env.example` was referenced by the README, the setup
+guide, the error messages and `MANIFEST.in` — and did not exist.
+
+**Solution.** The tools table is generated from the server's real signatures,
+the stale findings point at the round that reopened them, and `.env.example`
+lists every variable the harness reads. **Fixed** — `README.md`,
+`docs/FINDINGS.md`, `.env.example`.
+
+### F-44 — a run could not be explained after the fact
+
+**Measurement.** The audit trail — every mission, every reply, every harness
+that came back — was only written when a proposer was given an audit
+directory, and the general path never did. The general path also recorded no
+trajectory at all: the improver and the selector saw a diff and a verdict, and
+nothing of the solver's reasoning.
+
+**Solution.** The general path writes the audit trail, and the solver's
+reasoning is recorded as a trajectory in the shared grammar. **Fixed** —
+`harness2/cli/general.py`, `harness2/adapters/general.py`.
 
 ---
 
@@ -48,6 +218,10 @@ tree, render it into the workspace the way OpenCode loads it
 (`AGENTS.md`, `.opencode/{skills,agent,plugin}`, `scripts/`), run the
 solver there under a permission fence, and read the event stream back as
 the trajectory. **Fixed** — `harness2/adapters/general.py`.
+
+> **Reopened by the second round.** `47b7c19` replaced the substrate-driven
+> rollout with a direct model call and dropped the harness staging on the way,
+> so the harness stopped reaching the solver altogether. See **F-34**.
 
 ### F-02 — no entry point reached the engine
 
@@ -71,6 +245,11 @@ knew which paths the harness had authored.
 **Solution.** The launcher records the paths it authored, and
 `WorktreeManager.get_diff` excludes exactly those. **Fixed** —
 `harness2/adapters/worktree.py`.
+
+> **Reopened by the second round.** The `exclude` argument was never supplied
+> in production, and the launcher it depended on was dead. The general path
+> now stages the harness under `.harness_staged/` and excludes those paths
+> itself. See **F-34**.
 
 ### F-04 — worktrees lived in a global temp directory
 
@@ -319,6 +498,11 @@ asset, and the run's `test_output.txt` opens with an explicit
 `VERIFICATION: PASSED/FAILED` line, because with `-q` a test runner may
 print no summary of its own. **Fixed** —
 `harness2/adapters/general.py`, `tests/test_general_evidence.py`.
+
+> **Reopened by the second round.** The status was recorded in a dict that
+> nothing ever wrote to, so every general rollout still scored zero. It is now
+> recorded as the rollout runs and read back out of the artifact. See
+> **F-39**.
 
 ### F-17 — the evidence tree copied the repository, and then itself
 
@@ -569,6 +753,11 @@ design.
 working tree before and after the rollout, and inspects the worktree
 registry for entries the rollout added. A leak is reported in
 `<run>/leaks.txt`. **Fixed** — `harness2/adapters/general.py`.
+
+> **Reopened by the second round.** `_detect_leaks` was removed with the
+> substrate-driven rollout and never came back. The leak detection is worth
+> restoring; until then the `harness2-finish` guard (see **F-36**) is what
+> stands between a candidate and the repository.
 
 ### F-32 — the training script was rewritten twice
 
