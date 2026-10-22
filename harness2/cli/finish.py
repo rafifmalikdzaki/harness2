@@ -82,6 +82,9 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     ws = Path(args.workspace).expanduser().resolve()
+    if not (ws / ".git").exists():
+        print(f"Error: {ws} is not a git repository.", file=sys.stderr)
+        return 1
     db = MemoryDB(ws / ".harness2" / "memory.db")
     # The worktrees live next to the session's state, not in a global temp dir.
     # Looking in the wrong place is how this command reported "deleted 0
@@ -142,6 +145,20 @@ def main(argv=None) -> int:
             f"+{stats.get('bytes_added', 0):,} / -{stats.get('bytes_removed', 0):,} bytes"
         )
         print("    The change is in the working tree, unstaged. Review it with `git diff`.")
+        # Self-evolution: the lessons and the procedural skills are what make
+        # the NEXT run better than this one. The README describes this path as
+        # producing them, and it did not.
+        try:
+            from ..core.evolution import SelfEvolutionEngine
+
+            evolution = SelfEvolutionEngine(ws, db=db).analyze_session(args.session_id)
+            skills = evolution.get("synthesized_skills") or []
+            print(
+                f"    self-evolution: {evolution.get('status', 'skipped')}"
+                + (f", {len(skills)} skill(s) synthesized" if skills else "")
+            )
+        except Exception as exc:
+            print(f"    self-evolution: skipped ({exc})", file=sys.stderr)
         db.close_session(args.session_id, status="accepted")
     else:
         db.close_session(args.session_id, status="discarded")

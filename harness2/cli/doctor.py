@@ -18,7 +18,7 @@ The general path needs a model service, a git repository, a working worktree
 mechanism and a writable state directory. When one of them is missing, the
 failure used to surface as a traceback twenty minutes into a run.
 
-    harness2 doctor --workspace ~/Research/mmRetFund
+    harness2-doctor --workspace ~/Research/mmRetFund
 
 Every check prints what it found and, when it failed, the line that fixes it.
 """
@@ -26,6 +26,7 @@ Every check prints what it found and, when it failed, the line that fixes it.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -82,19 +83,41 @@ def _check_python(checks: Checks) -> None:
 def _check_provider(checks: Checks) -> None:
     provider = llm.resolve_provider()
     if provider is None:
+        # The BENCHMARK path does not use this provider -- it runs the
+        # OpenCode CLI on Vertex. Reporting a hard failure here was a false
+        # alarm for a configuration that works.
+        checks.add(
+            "model service (http)",
+            WARN,
+            "no OpenAI-compatible provider configured (the general path needs one)",
+            "set INCEPTION_API_KEY, or HARNESS2_LLM_BASE_URL / HARNESS2_LLM_API_KEY / "
+            "HARNESS2_LLM_MODEL",
+        )
+    else:
         checks.add(
             "model service",
-            FAIL,
-            "no provider configured",
-            "set INCEPTION_API_KEY in harness2/.env, or HARNESS2_LLM_BASE_URL, "
-            "HARNESS2_LLM_API_KEY and HARNESS2_LLM_MODEL",
+            OK,
+            f"{provider.name} / {provider.model} at {provider.base_url}",
         )
-        return
-    checks.add(
-        "model service",
-        OK,
-        f"{provider.name} / {provider.model} at {provider.base_url}",
-    )
+    # What the BENCHMARK path needs. It is a warning, not a failure: the
+    # general path does not use these models, and a user who only runs the
+    # general path should not be told the machine is broken.
+    try:
+        config.validate_models(judge=False)
+    except config.ConfigError as exc:
+        checks.add(
+            "executor/improver models (benchmark path)",
+            WARN,
+            str(exc),
+            "set HARNESS2_SOLVER_MODEL and HARNESS2_IMPROVER_MODEL (provider/model form) "
+            "to run a benchmark",
+        )
+    else:
+        checks.add(
+            "executor/improver models (benchmark path)",
+            OK,
+            f"solver {config.SOLVER_MODEL_OC}, improver {config.IMPROVER_MODEL}",
+        )
 
 
 def _check_mcp_package(checks: Checks) -> None:
@@ -197,19 +220,32 @@ def _check_state_dir(checks: Checks, workspace: Path | None) -> None:
     if workspace is None:
         return
     state = workspace / ".harness2"
-    try:
-        state.mkdir(parents=True, exist_ok=True)
-        probe = state / ".doctor-probe"
-        probe.write_text("x", encoding="utf-8")
-        probe.unlink()
-    except OSError as exc:
-        checks.add(
-            "harness state directory",
-            FAIL,
-            f"{state} is not writable: {exc}",
-            f"make {state} writable",
-        )
-        return
+    # A diagnostic must not write into the repository it is inspecting. The
+    # directory is probed if it exists; otherwise the PARENT's writability is
+    # what matters.
+    if state.is_dir():
+        try:
+            probe = state / ".doctor-probe"
+            probe.write_text("x", encoding="utf-8")
+            probe.unlink()
+        except OSError as exc:
+            checks.add(
+                "harness state directory",
+                FAIL,
+                f"{state} is not writable: {exc}",
+                f"make {state} writable",
+            )
+            return
+    else:
+        parent = state.parent
+        if not os.access(parent, os.W_OK):
+            checks.add(
+                "harness state directory",
+                FAIL,
+                f"{parent} is not writable, so {state} cannot be created",
+                f"make {parent} writable",
+            )
+            return
     checks.add("harness state directory", OK, str(state))
 
 
@@ -349,10 +385,12 @@ def main(argv=None) -> int:
     print(checks.render())
     print()
     if checks.failures:
-        print(f"{checks.failures} check(s) failed. The run will not work until they do.")
+        print(f"{checks.failures} check(s) failed. The general path will not work until they do.")
         return 1
     if checks.warnings:
-        print(f"{checks.warnings} warning(s). The run will work, with the caveats above.")
+        print(
+            f"{checks.warnings} warning(s). The general path will work, with the caveats above."
+        )
         return 0
     print("Everything checks out.")
     return 0

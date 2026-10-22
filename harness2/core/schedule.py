@@ -264,18 +264,25 @@ class TaskResult:
         }
 
 
-def _merged_status(merged: dict) -> str:
-    """ok iff every mode record on the merged summary succeeded and no error is recorded."""
+def _merged_status(merged: dict, expected_modes: Sequence[str] = ()) -> str:
+    """ok iff every expected mode succeeded and no error is recorded.
+
+    `expected_modes` is the set the task is supposed to finish. Without it
+    a task that had only finished its FIRST mode published "ok" -- because
+    the summary is written after every mode -- and a judge reads the
+    selections without looking at the status.
+    """
     modes = merged.get("modes") or {}
     selections = merged.get("selections") or {}
+    wanted = list(expected_modes) or list(modes)
     ok = (
         bool(modes)
         and not merged.get("errors")
         and all(
-            (value or {}).get("ok")
+            (modes.get(mode) or {}).get("ok")
             and (selections.get(mode) or {}).get("ok")
             and (selections.get(mode) or {}).get("chosen_label")
-            for mode, value in modes.items()
+            for mode in wanted
         )
     )
     return "ok" if ok else "partial"
@@ -288,12 +295,19 @@ def _load_old(path: Path) -> dict:
         return {}
 
 
-def _write_summary(summary_path: Path, res: TaskResult) -> dict:
+def _write_summary(
+    summary_path: Path, res: TaskResult, expected_modes: Sequence[str] = ()
+) -> dict:
     """Merge `res` into the summary under an flock, atomically, deriving the merged status.
 
     Modes may be written by separate processes, so records accumulate per mode.
     Returns the merged record, so the caller reports the status that was
     actually written rather than the one it had in hand.
+
+    `expected_modes` is the set of modes the task is supposed to finish. The
+    summary is written after EVERY mode, so without it a task that had only
+    finished its first mode published "ok" -- and a judge reads the
+    selections without looking at the status.
     """
     import fcntl
 
@@ -315,19 +329,39 @@ def _write_summary(summary_path: Path, res: TaskResult) -> dict:
                     if e == "no base rollout produced anything" and res.status in ("ok", "partial"):
                         continue
                     mode = str(e).partition(":")[0]
+                    # The test is against the MERGED record, not this
+                    # process's: another process's mode may have recovered.
                     if (
-                        (res.modes.get(mode) or {}).get("ok")
-                        and (res.selections.get(mode) or {}).get("ok")
-                        and (res.selections.get(mode) or {}).get("chosen_label")
+                        (merged["modes"].get(mode) or {}).get("ok")
+                        and (merged["selections"].get(mode) or {}).get("ok")
+                        and (merged["selections"].get(mode) or {}).get("chosen_label")
                     ):
                         continue
-                    if json.dumps(e, sort_keys=True, default=str) not in seen:
+                    key = json.dumps(e, sort_keys=True, default=str)
+                    if key not in seen:
                         merged["errors"].append(e)
+                        seen.add(key)
+
+                # The warnings are merged too. They were dropped, and a
+                # dropped warning is how a failed reflection became
+                # invisible.
+                merged["warnings"] = list(merged.get("warnings") or [])
+                wseen = {json.dumps(w, sort_keys=True, default=str) for w in merged["warnings"]}
+                for w in old.get("warnings") or []:
+                    key = json.dumps(w, sort_keys=True, default=str)
+                    if key not in wseen:
+                        merged["warnings"].append(w)
+                        wseen.add(key)
             # The status is always derived from the MERGED record, not from
             # this process's own modes. Deriving it only when the file already
             # existed meant a fresh task stored one status and a re-run stored
             # another, and the two did not mean the same thing.
-            merged["status"] = _merged_status(merged)
+            if res.status == "base-failed":
+                # A distinct outcome: the reference executions produced
+                # nothing, so there was nothing to improve on.
+                merged["status"] = "base-failed"
+            else:
+                merged["status"] = _merged_status(merged, expected_modes)
             tmp = summary_path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(merged, indent=2, default=str))
             os.replace(tmp, summary_path)
@@ -604,14 +638,20 @@ def _run_one_mode(
     if sel.ok and chosen is not None and not chosen.delivered:
         res.errors.append(f"{mode}: selected run {chosen.run_id} produced no deliverable")
     if mode_lib and sel.ok and library_store.has_experience(sel.experience):
-        mode_lib.add(
-            task_id,
-            chosen_tree,
-            why=sel.why,
-            label=sel.chosen_label,
-            run_id=sel.chosen_run_id,
-            experience=sel.experience,
-        )
+        try:
+            mode_lib.add(
+                task_id,
+                chosen_tree,
+                why=sel.why,
+                label=sel.chosen_label,
+                run_id=sel.chosen_run_id,
+                experience=sel.experience,
+            )
+        except Exception as exc:
+            # The library entry is a bonus on top of a selection that already
+            # happened. Losing it must not lose the selection -- and it must
+            # not make the task unresumable, which would re-pay it forever.
+            res.warnings.append(f"{mode}: could not write the library entry: {exc}")
 
 
 def run_task(
@@ -686,7 +726,7 @@ def run_task(
     if not any(b.ok for b in base):
         res.status = "base-failed"
         res.errors.append("no base rollout produced anything")
-        _write_summary(summary_path, res)
+        _write_summary(summary_path, res, modes)
         return res
 
     for mode in todo:
@@ -709,19 +749,29 @@ def run_task(
                 res=res,
             )
         except Exception as exc:
-            res.modes[mode] = {
-                "ok": False,
-                "error": f"{type(exc).__name__}: {exc}",
-                "traceback": traceback.format_exc()[-1500:],
-            }
-            res.errors.append(f"{mode}: {type(exc).__name__}: {exc}")
+            # The mode's record is NOT overwritten. It holds the stages, the
+            # rollouts and the ledger of work that was done and paid for;
+            # replacing it with a failure note made the mode unresumable, so
+            # every later sweep re-paid the whole task.
+            res.modes.setdefault(
+                mode,
+                {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc()[-1500:],
+                },
+            )
+            if res.modes.get(mode, {}).get("ok"):
+                res.warnings.append(f"{mode}: {type(exc).__name__}: {exc}")
+            else:
+                res.errors.append(f"{mode}: {type(exc).__name__}: {exc}")
         res.status = "partial"
-        _write_summary(summary_path, res)
+        _write_summary(summary_path, res, modes)
 
     # The status that was WRITTEN is the status to report: the summary merges
     # per-mode records from other processes, so the caller's own view of the
     # task can be older than the file on disk.
-    merged = _write_summary(summary_path, res)
+    merged = _write_summary(summary_path, res, modes)
     res.status = str(merged.get("status") or res.status)
     return res
 

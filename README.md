@@ -174,8 +174,9 @@ docker run -i --rm \
 
 Or run via `docker-compose`:
 ```bash
-# Start background services or execute commands inside the container
-docker-compose run --rm harness2 harness2-general --workspace /workspace --goal "..."
+# Run the general harness inside the container
+docker compose run --rm --entrypoint harness2-general harness2-mcp \
+  --workspace /workspace --goal "..."
 ```
 
 ---
@@ -261,6 +262,11 @@ compressed, library entries a newer entry supersedes are retired, and a
 retention policy keeps the recent runs in full while older runs keep their
 conclusions and lose their transcripts. The policy runs at the end of every
 general run, and can be inspected or applied directly via `harness2_memory_status`.
+
+The retention policy keeps the **selection record** — the file that names the
+recommended candidate — and drops the evidence around it. Losing that record
+made `harness2-finish` fall back to an arbitrary rollout, and the base
+execution is what it picked.
 
 **[docs/FINDINGS.md](docs/FINDINGS.md)** records every bottleneck this
 harness hit — the disk blow-up, the isolation escapes, the runtime
@@ -401,13 +407,13 @@ The Harness² MCP server exposes 11 production-ready tools for IDEs and autonomo
 | `harness2_solve` | `goal`, `workspace`, `verify_cmd`, `domain`, `k`, `repair_rounds`, `context_files`, `timeout` | **Main task solver:** Spawns divergent candidate rollouts (`minimal`, `skeptical`, `thorough`) in isolated git worktrees, verifies with tests, audits with an independent critic, and ranks the candidates. Nothing touches your working tree until `harness2_finish(action='accept')`. |
 | `harness2_finish` | `session_id`, `workspace`, `action` (`accept` or `discard`), `rollout_label`, `learned_facts`, `keep_worktrees`, `allow_destructive` | **Lifecycle finalizer:** `accept` applies the recommended candidate's diff to your tree and records learned facts; `discard` closes the session and removes the worktrees. A candidate whose diff *deletes files* is refused unless `allow_destructive` is set. |
 | `harness2_query_memory` | `workspace`, `category` | **Institutional memory query:** Reads structured facts and lessons from SQLite (`.harness2/memory.db`) and renders them as markdown. |
-| `harness2_apply_harness` | `harness_path`, `target_workspace`, `format`, `dry_run`, `backup` | **Harness materialization:** Installs synthesized guardrails and skills into active workspaces with single-pass collision-free merge and `.bak` protection. |
-| `harness2_inspect_library` | `domain`, `runs_dir` | **Experience library reader:** Inspects synthesized domain cues, heuristics, and reusable scripts from `.harness2/library/`. |
+| `harness2_apply_harness` | `harness_path`, `target_workspace`, `format`, `dry_run`, `backup` | **Harness materialization:** Installs synthesized guardrails and skills into active workspaces with single-pass collision-free merge and `.bak` protection. **Preview by default** — pass `dry_run=false` to apply. |
+| `harness2_inspect_library` | `domain`, `runs_dir`, `workspace` | **Experience library reader:** Inspects synthesized domain cues, heuristics, and reusable scripts from `.harness2/library/`. Pass `workspace` to see the general path's library. |
 | `harness2_list_sessions` | `workspace`, `status` | **Session auditor:** Lists sessions with their goal, status and chosen winner. |
 | `harness2_config_status` | `probe` | **Environment diagnostic:** Reports the provider and model the server will use. `probe=true` makes one live call to confirm the endpoint answers — by default it does not spend anything. |
 | `harness2_memory_status` | `workspace`, `prune`, `keep_evidence_runs`, `keep_transcript_runs`, `keep_runs`, `max_age_days` | **Memory policy:** Reports how much disk the harness's memory uses, and optionally applies the retention policy. |
 | `harness2_run_demo` | `k`, `mode`, `output_dir` | **Offline verification:** Runs deterministic offline Propose-Probe-Compose recursion without external API calls. |
-| `harness2_benchmark_status` | `bench`, `substrate` | **Benchmark readiness:** Runs the install checks for one benchmark and reports whether it is ready. |
+| `harness2_benchmark_status` | `bench`, `substrate`, `subset` | **Benchmark readiness:** Runs the install checks for one benchmark and reports whether it is ready. WorkBuddy needs a `subset`. |
 
 > `harness2_recursion` is the flagship: it runs the actual recursive loop.
 > `harness2_solve` is the cheaper, scripted path — candidates with different

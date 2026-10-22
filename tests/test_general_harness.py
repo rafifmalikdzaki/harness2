@@ -98,11 +98,20 @@ def test_long_term_memory_reaches_the_base_harness(tmp_path):
 
 
 def test_internal_state_is_gitignored(tmp_path):
+    """The state is excluded per-clone, and the project is not modified.
+
+    The exclusion used to go into the project's `.gitignore` as well, which
+    creates or rewrites a TRACKED file in the user's repository -- and the
+    harness promises the repository is not modified.
+    """
     repo = make_repo(tmp_path)
     GeneralTaskAdapter(repo_root=repo, goal="x")
-    ignore = (repo / ".gitignore").read_text(encoding="utf-8")
-    assert ".harness2/" in ignore
-    assert ".harness_staged/" in ignore
+    exclude = repo / ".git" / "info" / "exclude"
+    body = exclude.read_text(encoding="utf-8")
+    assert ".harness2/" in body
+    assert ".harness_staged/" in body
+    # The project itself is untouched.
+    assert not (repo / ".gitignore").exists()
 
 
 # ---------------------------------------------------------------- staging

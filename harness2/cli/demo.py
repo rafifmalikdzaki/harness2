@@ -25,10 +25,17 @@ from ..demo import DemoAdapter, DemoProposer
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=Path("runs/demo"))
-    parser.add_argument("--k", type=int, default=2)
-    parser.add_argument("--mode", choices=("parallel", "sequential", "both"), default="both")
+    parser = argparse.ArgumentParser(prog="harness2-demo", description=__doc__)
+    parser.add_argument(
+        "--output", type=Path, default=Path("runs/demo"), help="Where the run artifacts go"
+    )
+    parser.add_argument("--k", type=int, default=2, help="Recursion budget per task")
+    parser.add_argument(
+        "--mode",
+        choices=("parallel", "sequential", "both"),
+        default="both",
+        help="Which recursion mode(s) to run",
+    )
     args = parser.parse_args(argv)
     if args.k < 1:
         parser.error("--k must be positive")

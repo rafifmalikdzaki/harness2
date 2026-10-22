@@ -263,18 +263,20 @@ def harness2_apply_harness(
                 subpath = Path(*parts[scripts_idx + 1 :]) if len(parts) > scripts_idx + 1 else Path(file)
                 target_file = dest / "scripts" / subpath
             elif "sub_agents" in parts:
-                # Delegated sub-agents live in the framework's agent directory.
-                # At the workspace root nothing loads them.
+                # Delegated sub-agents live in the framework's agent directory,
+                # as a FLAT file -- the renderer writes
+                # `.opencode/agent/<name>.md`, not a directory. At the
+                # workspace root nothing loads them at all.
                 sub_idx = parts.index("sub_agents")
-                subpath = (
-                    Path(*parts[sub_idx + 1 :]) if len(parts) > sub_idx + 1 else Path(file)
-                )
                 base = {
                     "agy": ".gemini",
                     "codex": ".agents",
                     "claude": ".claude",
                 }.get(chosen_format, ".opencode")
-                target_file = dest / base / "agent" / subpath
+                if len(parts) > sub_idx + 1 and parts[-1] == "AGENT.md":
+                    target_file = dest / base / "agent" / f"{parts[sub_idx + 1]}.md"
+                else:
+                    target_file = dest / base / "agent" / Path(*parts[sub_idx + 1 :])
             elif "plugin" in parts:
                 plugin_idx = parts.index("plugin")
                 subpath = (
@@ -361,6 +363,13 @@ def harness2_apply_harness(
                 "backups_created": backups_created,
             }
         shutil.copy2(src_file, tgt_file)
+        if src_file.name == "AGENT.md":
+            # A sub-agent needs its frontmatter: OpenCode drops a file whose
+            # frontmatter does not say `mode: subagent`, SILENTLY, at load.
+            from harness2.substrate.render import ensure_mode_subagent
+
+            body = ensure_mode_subagent(tgt_file.read_text(encoding="utf-8", errors="replace"))
+            tgt_file.write_text(body, encoding="utf-8")
         executed_files.append(op["destination"])
 
     # 2. Append/merge combined instructions cleanly
@@ -1029,12 +1038,15 @@ def harness2_memory_status(
 def harness2_benchmark_status(
     bench: str = "jb",
     substrate: str = "oc",
+    subset: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Check installation status and task readiness of a benchmark (jb, lab, wb).
 
     Args:
         bench: Benchmark identifier ('jb', 'lab', 'wb').
         substrate: Substrate executor ('oc' or 'cx').
+        subset: Benchmark subset. WorkBuddy needs one ('office', 'web', 'code');
+            without it the check cannot run.
     """
     cmd = [
         sys.executable,
@@ -1045,6 +1057,8 @@ def harness2_benchmark_status(
         "--substrate",
         substrate,
     ]
+    if subset:
+        cmd += ["--subset", subset]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     except subprocess.TimeoutExpired:

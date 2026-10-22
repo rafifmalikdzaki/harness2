@@ -213,6 +213,22 @@ def _run_stage(
             spent_usd += exc.cost_usd
             all_cached = False
             break
+        except Exception as exc:
+            # Anything else -- a filesystem error reading the tree, a bug in
+            # the proposer -- becomes a fell-back stage. Letting it escape
+            # would discard every SIBLING stage too: `pool_x.map` re-raises
+            # the first exception, and the stages that ran, and were paid
+            # for, went with it.
+            return Stage(
+                label=label,
+                dim=dim,
+                tree=dict(fallback),
+                fell_back=True,
+                error=f"{type(exc).__name__}: {exc}"[:400],
+                usd=spent_usd,
+                attempts=spent_calls,
+                cached=all_cached,
+            )
         spent_usd += reply.cost_usd
         spent_calls += 0 if reply.cached else max(1, reply.attempts)
         all_cached = all_cached and reply.cached

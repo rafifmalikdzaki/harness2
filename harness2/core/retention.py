@@ -78,11 +78,28 @@ def _is_session_dir(p: Path) -> bool:
     return any(c.is_dir() and _is_candidate_dir(c) for c in children)
 
 
+def _is_task_dir(p: Path) -> bool:
+    """A directory holding one task's run artifacts.
+
+    The summary for EVERY mode lives in the parallel namespace's task
+    directory, so the sequential namespace's task directory has no
+    `summary.json` -- only `harnesses/`, `context/`, `selection/` and
+    `reflection/`. Without recognising it, the sequential mode's evidence
+    was never pruned, and the disk grew without bound.
+    """
+    if (p / "summary.json").is_file():
+        return True
+    for name in ("harnesses", "context", "selection", "reflection"):
+        if (p / name).is_dir():
+            return True
+    return False
+
+
 def _run_dirs(runs_root: Path) -> list[Path]:
     """The session directories under a runs root, oldest first."""
     if not runs_root.is_dir():
         return []
-    found: list[tuple[float, Path]] = []
+    found: list[tuple[float, str, Path]] = []
     for p in runs_root.iterdir():
         if not p.is_dir():
             continue
@@ -90,12 +107,21 @@ def _run_dirs(runs_root: Path) -> list[Path]:
         if any((c / "summary.json").is_file() for c in p.iterdir() if c.is_dir()):
             for c in p.iterdir():
                 if c.is_dir() and (c / "summary.json").is_file():
-                    found.append((c.stat().st_mtime, c))
+                    found.append((c.stat().st_mtime, c.name, c))
         elif (p / "summary.json").is_file():
-            found.append((p.stat().st_mtime, p))
+            found.append((p.stat().st_mtime, p.name, p))
         elif _is_session_dir(p):
-            found.append((p.stat().st_mtime, p))
-    return [p for _, p in sorted(found)]
+            found.append((p.stat().st_mtime, p.name, p))
+        else:
+            # A namespace directory whose task directories hold no summary --
+            # the sequential mode's.
+            for c in p.iterdir():
+                if c.is_dir() and _is_task_dir(c):
+                    found.append((c.stat().st_mtime, c.name, c))
+    # The tie is broken by the name, not by the path: the directory names
+    # carry the namespace, and the mtimes of directories created in the same
+    # second are identical.
+    return [d for _m, _n, d in sorted(found)]
 
 
 def _prune_tree(root: Path, names: tuple[str, ...]) -> int:
@@ -115,6 +141,54 @@ def _prune_tree(root: Path, names: tuple[str, ...]) -> int:
     return removed
 
 
+def _prune_selection(root: Path) -> int:
+    """Drop the evidence under a selection, but KEEP the selection record.
+
+    `selection.json` is the only place the recommended candidate is written
+    down. Deleting it with the evidence made `harness2-finish` fall back to
+    an arbitrary rollout -- the base execution, in practice -- and apply
+    that. The candidates and the copied source are the bulk, and they go.
+    """
+    removed = 0
+    for d in root.rglob("selection"):
+        if not d.is_dir():
+            continue
+        for child in d.iterdir():
+            if child.name == "selection.json":
+                continue
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+                removed += 1
+            else:
+                child.unlink(missing_ok=True)
+                removed += 1
+    return removed
+
+
+def _is_live(run: Path) -> bool:
+    """Whether another process is writing this run right now.
+
+    The summary is written under an flock, so a run whose lock is held is
+    in use. Deleting it would delete a live run -- and a run that another
+    process is writing is the one thing the policy must not touch.
+    """
+    lock = run / "summary.lock"
+    if not lock.is_file():
+        return False
+    try:
+        import fcntl
+
+        with open(lock, "w") as lf:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(lf, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return False
+
+
 def prune_runs(runs_root: Path, policy: RetentionPolicy | None = None) -> dict[str, int]:
     """Apply the retention policy. Returns what was removed."""
     policy = policy or RetentionPolicy()
@@ -132,7 +206,15 @@ def prune_runs(runs_root: Path, policy: RetentionPolicy | None = None) -> dict[s
     cutoff = time.time() - policy.max_age_days * 86400
 
     for run in runs:
-        old_enough = run.stat().st_mtime < cutoff
+        try:
+            mtime = run.stat().st_mtime
+        except FileNotFoundError:
+            # Another process pruned it between the scan and here.
+            continue
+        if _is_live(run):
+            # Being written. Leave it alone.
+            continue
+        old_enough = mtime < cutoff
         if old_enough or run not in keep:
             # Old enough to go entirely.
             shutil.rmtree(run, ignore_errors=True)
@@ -140,7 +222,8 @@ def prune_runs(runs_root: Path, policy: RetentionPolicy | None = None) -> dict[s
             continue
 
         if run not in recent_evidence:
-            counts["evidence_trees"] += _prune_tree(run, ("context", "reflection", "selection"))
+            counts["evidence_trees"] += _prune_tree(run, ("context", "reflection"))
+            counts["evidence_trees"] += _prune_selection(run)
         if run not in recent_transcript:
             counts["transcripts"] += _prune_tree(
                 run, ("trajectory.jsonl.gz", "trajectory.jsonl")

@@ -62,7 +62,7 @@ def _endpoint(path: Path, host: str, port: int) -> dict:
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(prog="harness2-bridge", description=__doc__)
     p.add_argument("--model", default=config.SOLVER_MODEL_CX, help="Vertex model ID to serve")
     p.add_argument(
         "--host",
@@ -71,6 +71,15 @@ def main(argv=None):
     )
     p.add_argument("--port", type=int, default=0, help="default: the saved port, else a free one")
     args = p.parse_args(argv)
+
+    if not args.model.strip():
+        # An empty model produced a LiteLLM config naming no model, and every
+        # request then failed with an unusable model id.
+        p.exit(
+            1,
+            "No model to serve: set HARNESS2_CODEX_MODEL or HARNESS2_SOLVER_MODEL, "
+            "or pass --model\n",
+        )
 
     litellm = Path(sys.executable).with_name("litellm")
     if not litellm.is_file():

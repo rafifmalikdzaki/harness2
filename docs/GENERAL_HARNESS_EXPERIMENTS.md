@@ -272,10 +272,16 @@ The agent cannot see the operator's keys, cannot write outside its
 workspace, and cannot see the operator's home at all.
 
 **And still.** The fence is not enough on its own, so the rollout is also
-**checked afterwards**: `GeneralTaskAdapter._detect_leaks` compares the
-user's working tree before and after the rollout, and inspects the worktree
-registry for entries the rollout added. A leak is reported in
-`<run>/leaks.txt` rather than discovered later.
+**checked afterwards**: the harness compares the user's working tree before
+and after the rollout, and inspects the worktree registry for entries the
+rollout added.
+
+> **The check is not implemented.** The `_detect_leaks` helper this section
+> describes was removed with the substrate-driven rollout and never came back.
+> What stands in its place is the guard in `harness2-finish`: a candidate whose
+> diff deletes files is refused until the operator says otherwise, and the
+> patch is read before it is applied. See **F-36** in
+> [FINDINGS.md](FINDINGS.md).
 
 ---
 
@@ -463,7 +469,7 @@ passed" meant "the tests that a worktree can run passed".
 | `d3d828c` | the general path's channel names a real model |
 | `ba74f1b` | the selection pool can include the base, for paths with no judge behind them |
 | `f5f3522` | the artifacts that escaped into this repository are removed |
-| — | the fence: the inherited MCP servers are dropped, Code Mode and OpenCode's session and worktree tools are denied, the rollout runs in a filesystem sandbox, and leaks are detected after the fact |
+| — | the fence: the inherited MCP servers are dropped, Code Mode and OpenCode's session and worktree tools are denied, the rollout runs in a filesystem sandbox, and the candidate's patch is read before it is applied |
 | — | the proposer is sandboxed too, and the selector's answer may name a label |
 
 ---
@@ -485,7 +491,7 @@ The result is left in an isolated worktree under
 `<workspace>/.harness2/worktrees/`; the repository itself is not modified.
 The report is at `<workspace>/.harness2/general_parallel_k2.json`, the
 experience library at `<workspace>/.harness2/library/k2/`, and the run
-artifacts (diff, trajectory, verifier output, leak report) under
+artifacts (diff, trajectory, verifier output) under
 `<workspace>/.harness2/runs/`.
 
 Useful flags:
@@ -513,7 +519,7 @@ tool.
   one.
 * The sandbox needs `bwrap`, and `bwrap` needs user namespaces. Where those
   are unavailable the fence still applies, but a shell command keeps the
-  operator's filesystem authority. The leak check is the backstop.
+  operator's filesystem authority. The patch guard is the backstop.
 * `bwrap` binds the system directories read-only but does not unshare the
   network: a rollout can still reach any host the operator can.
 * The installed OpenCode resolves a relative path against the *process*

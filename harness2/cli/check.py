@@ -25,9 +25,20 @@ from harness2.preflight import check
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="harness2-check", description=__doc__)
-    p.add_argument("--bench", choices=("jb", "lab", "wb"), required=True)
-    p.add_argument("--subset", choices=("office", "web", "code"))
-    p.add_argument("--substrate", choices=("oc", "cx"), default="oc")
+    p.add_argument(
+        "--bench", choices=("jb", "lab", "wb"), required=True, help="Which benchmark to check"
+    )
+    p.add_argument(
+        "--subset",
+        choices=("office", "web", "code"),
+        help="wb only: which subset to check",
+    )
+    p.add_argument(
+        "--substrate",
+        choices=("oc", "cx"),
+        default="oc",
+        help="Which agent runtime to check",
+    )
     args = p.parse_args(argv)
     try:
         adapter = make_adapter(args.bench, args.subset, args.substrate)

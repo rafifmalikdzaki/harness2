@@ -23,7 +23,15 @@ from ..adapters.general import GeneralTaskAdapter
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        prog="harness2-solve",
+        description=(
+            "Run ONE candidate rollout on a repository, in an isolated git worktree, "
+            "and print the diff. This is the single-shot path: it makes no harness "
+            "proposal and composes nothing. For the full recursive loop use "
+            "`harness2-general`."
+        ),
+    )
     parser.add_argument("goal", help="The engineering task or bugfix to solve")
     parser.add_argument("--workspace", "-w", default=".", help="Target repository root")
     parser.add_argument("--verify", "-v", default=None, help="Optional test command to run (e.g. 'pytest')")
@@ -31,6 +39,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     ws = Path(args.workspace).expanduser().resolve()
+    if not (ws / ".git").exists():
+        parser.error(f"--workspace {ws} is not a git repository")
     print(f"Initializing Harness² for: {args.goal}")
     print(f"Workspace: {ws}")
 

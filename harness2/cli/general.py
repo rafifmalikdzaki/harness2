@@ -169,6 +169,15 @@ def main(argv=None) -> int:
     parser.add_argument("--timeout", type=int, default=1800, help="Per-rollout timeout in seconds")
     parser.add_argument("--runs-root", type=Path, default=None, help="Where run artifacts go (default: <workspace>/.harness2/runs)")
     parser.add_argument(
+        "--new-session",
+        action="store_true",
+        help=(
+            "Start a fresh session instead of resuming the last one for this goal. "
+            "A run with the same goal resumes the previous one, so this is how you "
+            "ask for the work to be done again."
+        ),
+    )
+    parser.add_argument(
         "--progress",
         choices=("human", "json", "none"),
         default="human",
@@ -271,6 +280,7 @@ def main(argv=None) -> int:
             timeout=args.timeout,
             allow_mcp=args.allow_mcp,
             sandbox=not args.no_sandbox,
+            new_session=args.new_session,
         )
     except Exception as exc:
         print(f"Error: {type(exc).__name__}: {exc}", file=sys.stderr)

@@ -24,16 +24,27 @@ from harness2 import config, install
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("benchmark", choices=("jb", "lab", "wb"))
+    p = argparse.ArgumentParser(prog="harness2-setup", description=__doc__)
+    p.add_argument(
+        "benchmark", choices=("jb", "lab", "wb"), help="Which benchmark to install"
+    )
     p.add_argument(
         "--subset",
         choices=("office", "web", "code"),
         default=None,
         help="wb only: one subset to install; omitted installs office, web, and code",
     )
-    p.add_argument("--substrate", choices=("oc", "cx"), default="oc")
-    p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--substrate",
+        choices=("oc", "cx"),
+        default="oc",
+        help="Which agent runtime to install for",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would be installed without installing it",
+    )
     args = p.parse_args(argv)
     if args.subset and args.benchmark != "wb":
         p.error("--subset only applies to wb")

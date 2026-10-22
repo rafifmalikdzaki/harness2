@@ -257,6 +257,19 @@ class MemoryDB:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def list_active_sessions(self) -> List[Dict[str, Any]]:
+        """The sessions that are still open, oldest first.
+
+        A restarted run looks for one of these to resume, so a session id
+        is not minted afresh every time the harness is invoked.
+        """
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT session_id, goal, domain, status, created_at FROM sessions "
+                "WHERE status IN ('active', 'running') ORDER BY created_at ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def close_session(
         self,
         session_id: str,

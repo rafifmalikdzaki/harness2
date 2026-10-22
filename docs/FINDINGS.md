@@ -23,7 +23,7 @@ Status is one of:
 | B. Isolation | 10 | 7 | 3 | 0 |
 | C. Memory and disk | 6 | 5 | 1 | 0 |
 | D. The runtime | 6 | 6 | 0 | 0 |
-| E. Evidence and grading | 5 | 5 | 0 | 0 |
+| E. Evidence and grading | 5 | 4 | 0 | 1 |
 | F. The second round | 11 | 11 | 0 | 0 |
 
 The two that mattered most were **F-17** (the evidence tree copied the
@@ -758,7 +758,6 @@ registry for entries the rollout added. A leak is reported in
 > substrate-driven rollout and never came back. The leak detection is worth
 > restoring; until then the `harness2-finish` guard (see **F-36**) is what
 > stands between a candidate and the repository.
-
 ### F-32 — the training script was rewritten twice
 
 **Measurement.** Not a bottleneck but a cost: the training script went

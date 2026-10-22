@@ -70,15 +70,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     C.add_modes_arg(g)
     args = p.parse_args(argv)
-    modes = C.parse_modes(args.modes)
+    try:
+        modes = C.parse_modes(args.modes)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     try:
         ks = sorted({int(s) for s in args.k.split(",") if s.strip()})
     except ValueError:
-        raise SystemExit(f"--k takes a comma list of ints, got {args.k!r}")
+        print(f"error: --k takes a comma list of ints, got {args.k!r}", file=sys.stderr)
+        return 1
     if not ks:
-        raise SystemExit("--k named no scale")
+        print("error: --k named no scale", file=sys.stderr)
+        return 1
 
-    adapter = C.make_adapter(args.bench, args.subset, args.substrate)
+    try:
+        adapter = C.make_adapter(args.bench, args.subset, args.substrate)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     rows, fell_back, usd = [], {}, {}
     for k in ks:
         ns_dir = C.runs_root_for(adapter) / C.summary_namespace(adapter, k, seed=args.seed)

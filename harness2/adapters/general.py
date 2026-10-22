@@ -58,32 +58,47 @@ _SOURCE_ROOM_FILE_BYTES = 500_000
 _STAGE_DIR = ".harness_staged"
 
 
-def selection_file(workspace: Path, session_id: str) -> Optional[Path]:
+def selection_file(
+    workspace: Path, session_id: str, mode: str | None = None
+) -> Optional[Path]:
     """Where a session's selection record lives.
 
     Two layouts, because there are two entry points: `harness2_solve` writes
     one file per session, and the recursion path writes one per (mode, k)
-    under a namespace directory.
+    under a namespace directory. `mode` names the one to prefer; without it
+    the first match wins, and the first match is always the parallel mode's
+    -- so the sequential mode's recommendation was invisible.
     """
     runs = Path(workspace) / ".harness2" / "runs"
     direct = runs / session_id / "selection.json"
     if direct.is_file():
         return direct
-    for p in sorted(runs.glob(f"*/{session_id}/selection/*/selection.json")):
-        return p
-    return None
+    found = sorted(runs.glob(f"*/{session_id}/selection/*/selection.json"))
+    if not found:
+        return None
+    if mode:
+        # `selection/agg1` for the parallel mode, `selection/seq1` for the
+        # sequential one.
+        wanted = [p for p in found if p.parent.name.startswith(mode)]
+        if wanted:
+            return wanted[0]
+    return found[0]
 
 
-def recommended_label(workspace: Path, session_id: str) -> Optional[str]:
+def recommended_label(
+    workspace: Path, session_id: str, mode: str | None = None
+) -> Optional[str]:
     """The rollout the run recommended, if it recommended one."""
-    rec = _selection_record(workspace, session_id)
+    rec = _selection_record(workspace, session_id, mode)
     if rec is None:
         return None
     label = rec.get("chosen_label")
     return str(label) if label else None
 
 
-def recommended_run_label(workspace: Path, session_id: str) -> Optional[str]:
+def recommended_run_label(
+    workspace: Path, session_id: str, mode: str | None = None
+) -> Optional[str]:
     """The recommended rollout's RUN label, which is what its worktree is named after.
 
     A candidate's worktree is named after its run id
@@ -91,7 +106,7 @@ def recommended_run_label(workspace: Path, session_id: str) -> Optional[str]:
     while the selection records the stage label (`base1`). Applying by the
     stage label finds nothing.
     """
-    rec = _selection_record(workspace, session_id)
+    rec = _selection_record(workspace, session_id, mode)
     if rec is None:
         return None
     run_id = rec.get("chosen_run_id")
@@ -101,15 +116,37 @@ def recommended_run_label(workspace: Path, session_id: str) -> Optional[str]:
     return str(label) if label else None
 
 
-def _selection_record(workspace: Path, session_id: str) -> Optional[dict]:
-    f = selection_file(workspace, session_id)
-    if f is None:
-        return None
-    try:
-        rec = json.loads(f.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return rec if isinstance(rec, dict) else None
+def _selection_record(
+    workspace: Path, session_id: str, mode: str | None = None
+) -> Optional[dict]:
+    """The selection record, from the selection file or from the summary.
+
+    The summary survives the retention policy even when the selection
+    directory does not, and it names the chosen candidate too. Without this
+    fallback a pruned run left `harness2-finish` with nothing, and it
+    applied an arbitrary rollout -- the base execution.
+    """
+    f = selection_file(workspace, session_id, mode)
+    if f is not None:
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            rec = None
+        if isinstance(rec, dict) and rec.get("chosen_label"):
+            return rec
+    runs = Path(workspace) / ".harness2" / "runs"
+    for s in sorted(runs.glob(f"*/{session_id}/summary.json")):
+        try:
+            summary = json.loads(s.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        sels = summary.get("selections") or {}
+        names = [mode] if mode else sorted(sels)
+        for name in names:
+            sel = sels.get(name) or {}
+            if sel.get("chosen_label"):
+                return sel
+    return None
 
 
 def dirty_tree_warning(repo_root: Path) -> str:
@@ -230,15 +267,13 @@ def render_candidate_table(rows: List[Dict[str, object]]) -> str:
 
 
 def _ensure_excluded(repo: Path, entry: str) -> None:
-    """Ignore Harness² state in both .gitignore and .git/info/exclude."""
-    gi = repo / ".gitignore"
-    if gi.is_file():
-        content = gi.read_text(encoding="utf-8", errors="replace")
-        if entry not in content:
-            gi.write_text(content.rstrip() + f"\n{entry}\n", encoding="utf-8")
-    else:
-        gi.write_text(f"{entry}\n", encoding="utf-8")
+    """Keep Harness² state out of the user's commits.
 
+    The exclusion goes into `.git/info/exclude`, which is per-clone and
+    invisible to git. It used to go into the project's `.gitignore` as
+    well -- which creates or rewrites a TRACKED file in the user's
+    repository, and the harness promises the repository is not modified.
+    """
     git_dir = repo / ".git"
     if git_dir.is_file():  # worktree/submodule: "gitdir: <path>"
         git_dir = Path(git_dir.read_text().split(":", 1)[1].strip())
@@ -246,7 +281,7 @@ def _ensure_excluded(repo: Path, entry: str) -> None:
     ex.parent.mkdir(parents=True, exist_ok=True)
     content = ex.read_text(encoding="utf-8", errors="replace") if ex.is_file() else ""
     if entry not in content.splitlines():
-        ex.write_text(content.rstrip() + ("\n" if content else "") + f"{entry}\n", encoding="utf-8")
+        ex.write_text(content.rstrip() + ("\n" if content else "") + f"\n{entry}\n", encoding="utf-8")
 
 
 class GeneralTaskAdapter:
@@ -267,6 +302,7 @@ class GeneralTaskAdapter:
         sandbox: bool = True,
         channel: str = "http",
         runtime: str = "http",
+        new_session: bool = False,
     ):
         self.repo_root = Path(repo_root).expanduser().resolve()
         self.goal = goal.strip()
@@ -309,7 +345,12 @@ class GeneralTaskAdapter:
         _ensure_excluded(self.repo_root, ".harness_staged/")
 
         self.db = MemoryDB(self.harness_dir / "memory.db")
-        self.session_id = session_id or self.db.start_session(self.goal, self.domain)
+        if session_id:
+            self.session_id = session_id
+        elif new_session:
+            self.session_id = self.db.start_session(self.goal, self.domain)
+        else:
+            self.session_id = self._resume_session()
 
         # Per-repo worktree root: the general path never shares state through
         # a global temp dir, and it lands next to the .harness2 state.
@@ -354,6 +395,22 @@ class GeneralTaskAdapter:
     # ------------------------------------------------------------------
     # harness
     # ------------------------------------------------------------------
+
+    def _resume_session(self) -> str:
+        """The session this run belongs to.
+
+        A new session id on every invocation made the general path
+        UNRESUMABLE: the session id is in the run id and in the run
+        directory, so a restarted run found none of the previous run's
+        rollouts and re-paid for every one of them.
+
+        So an ACTIVE session with the same goal and domain is reused, and a
+        new one is started only when there is nothing to resume.
+        """
+        for row in self.db.list_active_sessions():
+            if row.get("goal") == self.goal and row.get("domain") == self.domain:
+                return str(row["session_id"])
+        return self.db.start_session(self.goal, self.domain)
 
     def _ensure_base_harness(self) -> Path:
         base_dir = self.harness_dir / "base"
@@ -783,14 +840,6 @@ class GeneralTaskAdapter:
             else {"score": None, "issues": [], "unverified_claims": []}
         )
         log["review"] = review
-        self.db.record_rollout(
-            session_id=self.session_id,
-            label=label,
-            worktree_path=str(wt_path),
-            git_diff=git_diff,
-            test_passed=test_passed,
-            test_output=test_output,
-        )
 
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "diff.patch").write_text(git_diff, encoding="utf-8")
@@ -803,6 +852,17 @@ class GeneralTaskAdapter:
         (run_dir / "candidate.json").write_text(
             json.dumps({**log, "claims": claims, "test_passed": test_passed}, indent=2),
             encoding="utf-8",
+        )
+        # The DB row is written AFTER the artifacts: a row that points at a
+        # diff.patch that does not exist is a candidate the finish command
+        # would pick and then fail to apply.
+        self.db.record_rollout(
+            session_id=self.session_id,
+            label=label,
+            worktree_path=str(wt_path),
+            git_diff=git_diff,
+            test_passed=test_passed,
+            test_output=test_output,
         )
         # Recorded last: the marker says the rollout finished, so it is only
         # written once every artifact is on disk.

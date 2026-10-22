@@ -25,6 +25,7 @@ summary. Roots are scoped per run and mode, so each sweep starts every domain em
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -123,9 +124,15 @@ class Library:
         context.assert_tree_has_no_grader_verdicts({"EXPERIENCE.md": str(experience) + why})
         d = self.entry_dir(task_id)
 
+        # The harness is written into a sibling and moved into place: a
+        # reader that copies the library while an entry is being written used
+        # to find the entry with NO harness at all.
+        staged = d / "harness.new"
+        shutil.rmtree(staged, ignore_errors=True)
+        staged.mkdir(parents=True, exist_ok=True)
+        harness_tree.write_tree(self.surface, harness, staged, stubs=False)
         shutil.rmtree(d / "harness", ignore_errors=True)
-        (d / "harness").mkdir(parents=True, exist_ok=True)
-        harness_tree.write_tree(self.surface, harness, d / "harness", stubs=False)
+        os.replace(staged, d / "harness")
 
         exp = experience or {}
         lines = [
@@ -177,7 +184,12 @@ class Library:
                 rows.append(f"- cue:     {cue}")
             rows.append("")
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.index.write_text("\n".join(rows), encoding="utf-8")
+        # The index is written atomically: a reader that copies the library
+        # mid-write used to get a truncated file, and two writers could leave
+        # a mixed one.
+        tmp = self.index.with_suffix(".md.tmp")
+        tmp.write_text("\n".join(rows), encoding="utf-8")
+        os.replace(tmp, self.index)
         return self.index
 
     def compact(self, *, keep: int = 24) -> int:

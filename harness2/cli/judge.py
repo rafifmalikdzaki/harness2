@@ -160,7 +160,11 @@ def main(argv: list[str] | None = None) -> int:
         "instead of the selected runs",
     )
     args = p.parse_args(argv)
-    modes = C.parse_modes(args.modes)
+    try:
+        modes = C.parse_modes(args.modes)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     try:
         config.validate_models(judge=True)
@@ -169,7 +173,11 @@ def main(argv: list[str] | None = None) -> int:
         # missing and exit with the usual status.
         print(f"Error: {exc}", file=sys.stderr)
         return 1
-    adapter = C.make_adapter(args.bench, args.subset, args.substrate)
+    try:
+        adapter = C.make_adapter(args.bench, args.subset, args.substrate)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     ns = C.summary_namespace(adapter, args.k, seed=args.seed)
     ns_dir = C.runs_root_for(adapter) / ns
     identity = ns_dir / "config.json"

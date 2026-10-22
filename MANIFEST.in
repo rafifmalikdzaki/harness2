@@ -1,8 +1,11 @@
 include README.md .env.example
 recursive-include docs *.md
 recursive-include scripts *.py *.sh
-recursive-include harness2/third_party *
-include dependencies/README.md dependencies/PINNED.md
+# The third-party material lives at the REPO ROOT, not under harness2/. The
+# path used to name a directory that does not exist, so an sdist shipped none
+# of it and `harness2-setup <bench>` could not run.
+recursive-include third_party *
+include dependencies/README.md dependencies/PINNED.md dependencies/ASSETS.json
 global-exclude __pycache__ *.py[cod] *.log
 
-recursive-include assets *.png
+recursive-include assets *.png *.gif
