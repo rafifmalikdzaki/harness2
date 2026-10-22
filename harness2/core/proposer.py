@@ -191,6 +191,9 @@ class Proposer:
     _calls: list[Reply] = field(default_factory=list)
     # Token counts from the last call, for channels that report usage but no price.
     _last_usage: dict = field(default_factory=dict)
+    # The model a channel actually ran on. The `http` channel resolves it at
+    # call time, so the spec can be empty.
+    _last_model: str = ""
 
     def __post_init__(self) -> None:
         if not self.spec.model.strip() and self.spec.kind != "http":
@@ -371,6 +374,7 @@ class Proposer:
             except llm.LLMError as exc:
                 return "", 0.0, str(exc)
             self._last_usage = usage
+            self._last_model = provider.model
             if kind == "answer":
                 if not reply.strip():
                     last_err = "empty reply"
@@ -574,7 +578,7 @@ class Proposer:
                     "label": r.label,
                     "ok": r.ok,
                     "channel": r.channel,
-                    "model": self.spec.model,
+                    "model": self._last_model or self.spec.model,
                     "effort": self.spec.effort,
                     "attempts": r.attempts,
                     "wall_s": r.wall_s,

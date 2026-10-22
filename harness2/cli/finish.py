@@ -17,10 +17,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
+from ..adapters.general import recommended_label, recommended_run_label
 from ..adapters.worktree import WorktreeError, WorktreeManager
 from ..core.memory_db import MemoryDB
 
@@ -32,21 +32,30 @@ def _recommended_label(ws: Path, session_id: str, rollouts: list) -> str | None:
     recorded last, which is how this command used to pick what to apply to
     somebody's repository.
     """
-    sel_file = ws / ".harness2" / "runs" / session_id / "selection.json"
-    if sel_file.is_file():
-        try:
-            rec = json.loads(sel_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            rec = {}
-        label = rec.get("recommended")
-        if label:
-            return str(label)
+    label = recommended_label(ws, session_id)
+    if label:
+        return label
     passed = [r for r in rollouts if r.get("test_passed") == 1]
     if passed:
         return str(passed[0].get("label"))
     if rollouts:
         return str(rollouts[0].get("label"))
     return None
+
+
+def _worktree_path(ws: Path, session_id: str, label: str) -> str | None:
+    """The recommended candidate's worktree, from the selection's run id.
+
+    A candidate's worktree is named after its run id, not after the stage
+    label the selection records, so the stage label alone finds nothing.
+    """
+    run_label = recommended_run_label(ws, session_id)
+    if not run_label:
+        return None
+    root = ws / ".harness2" / "worktrees"
+    clean = session_id.replace("sess_", "")
+    candidate = root / f"{clean}_{run_label}"
+    return str(candidate) if candidate.is_dir() else None
 
 
 def main(argv=None) -> int:
@@ -97,9 +106,24 @@ def main(argv=None) -> int:
         if best_label is None:
             print("Error: no rollout was selected to apply.", file=sys.stderr)
             return 1
+        # The worktree is named after the candidate's RUN label, so the
+        # recorded path is the only reliable way to find it.
+        worktree_path = next(
+            (
+                r.get("worktree_path")
+                for r in rollouts
+                if r.get("label") == best_label or str(r.get("label", "")).endswith(best_label)
+            ),
+            None,
+        )
+        if worktree_path is None:
+            worktree_path = _worktree_path(ws, args.session_id, best_label)
         try:
             result = wt_mgr.apply_to_repo(
-                args.session_id, best_label, allow_destructive=args.allow_destructive
+                args.session_id,
+                best_label,
+                allow_destructive=args.allow_destructive,
+                worktree_path=worktree_path,
             )
         except WorktreeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
@@ -117,6 +141,7 @@ def main(argv=None) -> int:
             f"    {stats.get('files_changed', 0)} file(s) changed: "
             f"+{stats.get('bytes_added', 0):,} / -{stats.get('bytes_removed', 0):,} bytes"
         )
+        print("    The change is staged. Review it with `git diff --cached`, then commit.")
         db.close_session(args.session_id, status="accepted")
     else:
         db.close_session(args.session_id, status="discarded")

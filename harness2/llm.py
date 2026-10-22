@@ -98,7 +98,9 @@ def chat(
         {"model": p.model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
     ).encode()
     last: Exception | None = None
+    rate_limited = False
     for attempt in range(retries):
+        rate_limited = False
         req = urllib.request.Request(
             f"{p.base_url}/chat/completions",
             data=payload,
@@ -114,13 +116,23 @@ def chat(
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:500]
             last = LLMError(f"HTTP {e.code} from {p.name}: {body}")
-            if e.code in (400, 401, 403, 404):
+            if e.code == 429:
+                # A token bucket, not a bad request. It clears on its own, so
+                # it is worth waiting for -- and worth saying so.
+                last = LLMError(
+                    f"rate limited by {p.name} (HTTP 429): {body}. "
+                    f"This is transient -- the request was refused before it ran. "
+                    f"Wait a moment and retry."
+                )
+                rate_limited = True
+            elif e.code in (400, 401, 403, 404):
                 break
         except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError) as e:
             last = e
-        # Back off, but never after the final attempt: there is nothing to wait for.
+        # Back off, but never after the final attempt: there is nothing to
+        # wait for. A rate limit gets a longer wait than a flaky socket.
         if attempt < retries - 1:
-            time.sleep(2**attempt)
+            time.sleep(5 * (attempt + 1) if rate_limited else 2**attempt)
     raise LLMError(f"LLM call failed: {last}")
 
 

@@ -63,6 +63,22 @@ class WorktreeManager:
         clean_sess = session_id.replace("sess_", "")
         return self.base_temp_dir / f"{clean_sess}_{label}"
 
+    def resolve_worktree(
+        self, session_id: str, label: str, worktree_path: str | Path | None = None
+    ) -> Path:
+        """Where a candidate's worktree is.
+
+        The recorded path wins when there is one. A candidate's worktree is
+        named after its RUN label, which carries the namespace and the session
+        id, while the selection records the stage label (`base1`, `inv2`) --
+        so computing the path from the stage label finds nothing.
+        """
+        if worktree_path:
+            p = Path(worktree_path)
+            if p.is_dir():
+                return p
+        return self.worktree_dir(session_id, label)
+
     def create(self, session_id: str, label: str) -> Path:
         """Create a new worktree branched from current HEAD."""
         dest = self.worktree_dir(session_id, label)
@@ -175,6 +191,7 @@ class WorktreeManager:
         label: str,
         *,
         allow_destructive: bool = False,
+        worktree_path: str | Path | None = None,
     ) -> dict:
         """Apply genuine code changes from the worktree into the primary repo working directory.
 
@@ -186,7 +203,7 @@ class WorktreeManager:
         and an empty patch used to be reported as a successful apply: the
         changes were silently lost and the caller was told they were applied.
         """
-        dest = self.worktree_dir(session_id, label)
+        dest = self.resolve_worktree(session_id, label, worktree_path)
         if not dest.is_dir():
             raise WorktreeError(f"Worktree directory {dest} does not exist.")
 

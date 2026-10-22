@@ -51,6 +51,60 @@ _SOURCE_ROOM_FILE_BYTES = 500_000
 _STAGE_DIR = ".harness_staged"
 
 
+def selection_file(workspace: Path, session_id: str) -> Optional[Path]:
+    """Where a session's selection record lives.
+
+    Two layouts, because there are two entry points: `harness2_solve` writes
+    one file per session, and the recursion path writes one per (mode, k)
+    under a namespace directory.
+    """
+    runs = Path(workspace) / ".harness2" / "runs"
+    direct = runs / session_id / "selection.json"
+    if direct.is_file():
+        return direct
+    for p in sorted(runs.glob(f"*/{session_id}/selection/*/selection.json")):
+        return p
+    return None
+
+
+def recommended_label(workspace: Path, session_id: str) -> Optional[str]:
+    """The rollout the run recommended, if it recommended one."""
+    rec = _selection_record(workspace, session_id)
+    if rec is None:
+        return None
+    label = rec.get("chosen_label")
+    return str(label) if label else None
+
+
+def recommended_run_label(workspace: Path, session_id: str) -> Optional[str]:
+    """The recommended rollout's RUN label, which is what its worktree is named after.
+
+    A candidate's worktree is named after its run id
+    (`general-oc-agg1/sess_x/base1` -> `..._general-oc-agg1__sess_x__base1`),
+    while the selection records the stage label (`base1`). Applying by the
+    stage label finds nothing.
+    """
+    rec = _selection_record(workspace, session_id)
+    if rec is None:
+        return None
+    run_id = rec.get("chosen_run_id")
+    if run_id:
+        return str(run_id).replace("/", "__")
+    label = rec.get("chosen_label")
+    return str(label) if label else None
+
+
+def _selection_record(workspace: Path, session_id: str) -> Optional[dict]:
+    f = selection_file(workspace, session_id)
+    if f is None:
+        return None
+    try:
+        rec = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
 def dirty_tree_warning(repo_root: Path) -> str:
     """A warning when the working tree has uncommitted changes.
 

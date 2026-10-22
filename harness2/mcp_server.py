@@ -477,19 +477,27 @@ def harness2_finish(
     evolution_result: Dict[str, Any] = {"status": "skipped"}
     if action == "accept":
         labels = [r["label"] for r in session.get("rollouts", [])]
-        sel_file = ws / ".harness2" / "runs" / session_id / "selection.json"
         if rollout_label:
             chosen = rollout_label
-        elif sel_file.is_file():
-            chosen = json.loads(sel_file.read_text(encoding="utf-8")).get("recommended")
         else:
+            from harness2.adapters.general import recommended_label
+
+            chosen = recommended_label(ws, session_id)
+        if not chosen:
             passed = [r for r in session.get("rollouts", []) if r.get("test_passed") == 1]
             chosen = (passed or session.get("rollouts", [{}]))[0].get("label")
         if chosen not in labels:
             return {"status": "error", "message": f"Unknown rollout {chosen!r}; choose from {labels}."}
         try:
+            worktree_path = next(
+                (r.get("worktree_path") for r in session.get("rollouts", []) if r.get("label") == chosen),
+                None,
+            )
             apply_result = wt_mgr.apply_to_repo(
-                session_id, chosen, allow_destructive=allow_destructive
+                session_id,
+                chosen,
+                allow_destructive=allow_destructive,
+                worktree_path=worktree_path,
             )
         except Exception as e:
             return {"status": "error", "message": f"Apply failed, nothing cleaned up: {e}"}
@@ -530,7 +538,10 @@ def harness2_finish(
         "applied_stats": apply_result.get("stats", {}),
         "deleted_worktrees": cleaned,
         "self_evolution": evolution_result,
-        "note": "Changes are applied to the working tree only; review `git diff` and commit yourself.",
+        "note": (
+            "The change is staged in the working tree. Review it with "
+            "`git diff --cached` and commit it yourself."
+        ),
     }
 
 
