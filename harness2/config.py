@@ -172,7 +172,15 @@ WB_MAX_TRIALS = {"oc": 2, "cx": 2}
 WB_MODEL_CONNECTION = "local_proxy"
 
 DEFAULT_PROPOSER_CHANNEL = "opencode"
-PROPOSER_MODEL_BY_CHANNEL = {"opencode": IMPROVER_MODEL, "claude_cli": IMPROVER_MODEL}
+# The `http` channel talks to the same OpenAI-compatible endpoint the general
+# path's solver uses, so one API key runs the whole loop. Its model defaults to
+# the provider's own model when this is unset.
+HTTP_PROPOSER_MODEL = env("HARNESS2_IMPROVER_MODEL_HTTP", "")
+PROPOSER_MODEL_BY_CHANNEL = {
+    "opencode": IMPROVER_MODEL,
+    "claude_cli": IMPROVER_MODEL,
+    "http": HTTP_PROPOSER_MODEL,
+}
 PHASE_WIDTH = 2
 TRANSPORT_ATTEMPTS = 2
 PROPOSER_CONCURRENCY = 2

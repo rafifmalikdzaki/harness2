@@ -69,8 +69,9 @@ def test_the_score_reads_the_recorded_exit_status(tmp_path):
     run_dir.mkdir()
     (run_dir / "test_output.txt").write_text("166 passed, 1 skipped in 22.36s\n", encoding="utf-8")
 
-    # No recorded status: the command never ran. That is not a pass.
-    assert adapter.score(run_dir, "t")["n_passed"] == 0
+    # No recorded status and no verdict header: the command never ran. That is
+    # neither a pass nor a failure -- it is ungraded, and ungraded is not zero.
+    assert adapter.score(run_dir, "t") is None
 
     adapter._verdicts["run"] = True
     graded = adapter.score(run_dir, "t")
@@ -78,6 +79,24 @@ def test_the_score_reads_the_recorded_exit_status(tmp_path):
     assert graded["n_criteria"] == 1
 
     adapter._verdicts["run"] = False
+    assert adapter.score(run_dir, "t")["n_passed"] == 0
+
+
+def test_the_score_reads_the_verdict_back_out_of_the_artifact(tmp_path):
+    """A judge in another process sees the verdict the rollout recorded."""
+    repo = make_repo(tmp_path)
+    adapter = GeneralTaskAdapter(repo_root=repo, goal="x", verify_cmd="true")
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "test_output.txt").write_text(
+        "VERIFICATION: PASSED (exit status 0)\n\n17 passed in 2.26s\n", encoding="utf-8"
+    )
+    assert adapter.score(run_dir, "t")["n_passed"] == 1
+
+    (run_dir / "test_output.txt").write_text(
+        "VERIFICATION: FAILED (exit status 1)\n\n3 failed\n", encoding="utf-8"
+    )
     assert adapter.score(run_dir, "t")["n_passed"] == 0
 
 

@@ -34,9 +34,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import config
+from .. import llm
 from ..adapters.sandbox import sandbox_available
 from ..substrate.opencode import opencode_command
 from .spec import ChannelSpec
+from .tree import normalize_rel
 
 SYSTEM_ARG_MAX = 120_000
 
@@ -52,6 +54,48 @@ _DROP_ENV = (
     "ANTHROPIC_BEDROCK_BASE_URL",
     "CLAUDE_CODE_USE_BEDROCK",
 )
+
+
+# The `http` channel has no agent process behind it, so the contract with the
+# model is explicit: the harness files go in the prompt, the edits come back as
+# JSON, and this module applies them to the tree.
+_HTTP_SYSTEM = """You are the improver of an autonomous agent's harness.
+
+You are given a MISSION and the CURRENT harness files. Reply with ONLY a JSON object:
+
+{"notes": "<one short paragraph: what you changed and why, tracing each change to a moment in the evidence>",
+ "edits": [{"path": "<path relative to the harness root>", "action": "write"|"delete", "content": "<the full new file content>"}]}
+
+Rules:
+- For every write, give the FULL new content of the file. Never a diff, never
+  "... unchanged", never a partial file.
+- "action": "delete" removes the file and needs no "content".
+- Only edit paths the MISSION lists as editable. A path outside that list is
+  rejected and the whole proposal is refused.
+- Keep every change traceable to a moment in the evidence the MISSION points at.
+- If the harness should stay as it is, return an empty "edits" list and say why
+  in "notes".
+- No prose outside the JSON object."""
+
+
+def _http_prompt(mission: str, system: str, files: dict[str, str]) -> str:
+    """The user message for the http channel: mission, then the current tree."""
+    parts = [f"# MISSION\n\n{mission}"]
+    if system:
+        parts.append(f"# ADDITIONAL INSTRUCTIONS\n\n{system}")
+    if files:
+        rendered = []
+        for rel in sorted(files):
+            body = files[rel]
+            rendered.append(f'<file path="{rel}">\n{body}\n</file>')
+        parts.append(
+            "# CURRENT HARNESS FILES\n\n"
+            "These are the files you are editing. Emit an edit for each one you change.\n\n"
+            + "\n\n".join(rendered)
+        )
+    else:
+        parts.append("# CURRENT HARNESS FILES\n\n(the harness is empty)")
+    return "\n\n".join(parts)
 
 
 def _obj(d: dict, key: str) -> dict:
@@ -99,9 +143,11 @@ class Proposer:
     project: str = field(default_factory=lambda: config.VERTEX_PROJECT)
     region: str = field(default_factory=lambda: config.VERTEX_REGION)
     _calls: list[Reply] = field(default_factory=list)
+    # Token counts from the last call, for channels that report usage but no price.
+    _last_usage: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.spec.model.strip():
+        if not self.spec.model.strip() and self.spec.kind != "http":
             raise ValueError("Set HARNESS2_IMPROVER_MODEL before starting model sessions")
 
     def env(self) -> dict[str, str]:
@@ -161,9 +207,7 @@ class Proposer:
                 if context_dir and Path(context_dir).is_dir():
                     shutil.copytree(context_dir, tmp / "context", dirs_exist_ok=True)
                 with _SEM if _SEM is not None else contextlib.nullcontext():
-                    text, cost, err = (
-                        self._claude_cli if self.spec.kind == "claude_cli" else self._opencode
-                    )(tmp, mission, system, wall)
+                    text, cost, err = self._dispatch(tmp, mission, system, wall)
                 spent_usd += cost
                 if not text.strip():
                     last = err or "empty reply"
@@ -208,6 +252,86 @@ class Proposer:
             attempts=tries,
             cost_usd=spent_usd,
         )
+
+    def _dispatch(
+        self, cwd: Path, mission: str, system: str, wall: int
+    ) -> tuple[str, float, str]:
+        """Run the session on this channel's backend."""
+        if self.spec.kind == "claude_cli":
+            return self._claude_cli(cwd, mission, system, wall)
+        if self.spec.kind == "http":
+            return self._http(cwd, mission, system, wall)
+        return self._opencode(cwd, mission, system, wall)
+
+    def _http(self, cwd: Path, mission: str, system: str, wall: int) -> tuple[str, float, str]:
+        """Propose harness edits over the plain HTTP chat client.
+
+        No agent process runs here, so this channel owns the whole round trip: it
+        reads the harness tree out of the session directory, sends it with the
+        mission, and writes the model's edits back into the tree. Everything
+        downstream is unchanged -- the stage reads the tree back and validates it,
+        and an invalid tree is refused with the same feedback as any other channel.
+
+        Cost is reported as 0.0 because an OpenAI-compatible endpoint does not
+        return a price. The token counts land in the audit trail instead, so a
+        session on this channel is metered rather than priced.
+        """
+        harness_dir = _find_harness_dir(cwd)
+        if harness_dir is None:
+            return "", 0.0, "no harness directory to edit"
+
+        provider = llm.resolve_provider()
+        if provider is None:
+            return "", 0.0, (
+                "no LLM configured: set INCEPTION_API_KEY (or HARNESS2_LLM_BASE_URL, "
+                "HARNESS2_LLM_API_KEY and HARNESS2_LLM_MODEL) to use the http channel"
+            )
+
+        files = _read_harness_files(harness_dir)
+        usage: dict = {}
+        try:
+            reply = llm.chat(
+                [
+                    {"role": "system", "content": _HTTP_SYSTEM},
+                    {"role": "user", "content": _http_prompt(mission, system, files)},
+                ],
+                temperature=0.4,
+                max_tokens=16000,
+                provider=provider,
+                timeout=max(30, min(int(wall), 900)),
+                usage=usage,
+            )
+        except llm.LLMError as exc:
+            return "", 0.0, str(exc)
+        self._last_usage = usage
+
+        try:
+            data = llm.extract_json(reply)
+        except (llm.LLMError, ValueError) as exc:
+            return "", 0.0, f"the proposal was not valid JSON: {exc}"
+        if not isinstance(data, dict):
+            return "", 0.0, f"the proposal was not a JSON object: {type(data).__name__}"
+
+        edits = data.get("edits")
+        if edits is None:
+            edits = []
+        if not isinstance(edits, list):
+            return "", 0.0, "'edits' was not a list"
+
+        applied, refused = _apply_harness_edits(harness_dir, edits)
+        notes = str(data.get("notes") or "").strip()
+        if not applied and not refused:
+            notes = notes or "(the proposal changed nothing)"
+        summary = {
+            "edits_applied": applied,
+            "edits_refused": refused,
+            "model": provider.model,
+        }
+        text = (
+            f"<notes>\n{notes or '(no notes given)'}\n</notes>\n\n"
+            f"```json\n{json.dumps(summary, indent=2)}\n```"
+        )
+        return text, 0.0, ""
 
     def _claude_cli(
         self, cwd: Path, mission: str, system: str, wall: int
@@ -373,6 +497,8 @@ class Proposer:
                     "attempts": r.attempts,
                     "wall_s": r.wall_s,
                     "cost_usd": r.cost_usd,
+                    "cost_known": r.channel != "http",
+                    "usage": self._last_usage or {},
                     "error": r.error,
                 },
                 indent=2,
@@ -386,6 +512,81 @@ def _drop_workspace(paths: dict[str, Path] | None) -> None:
     """Remove a stale harvested workspace so a later cache read cannot serve it."""
     if paths:
         shutil.rmtree(paths["workspace"], ignore_errors=True)
+
+
+def _find_harness_dir(cwd: Path) -> Path | None:
+    """The harness tree inside a session's working directory."""
+    for cand in (cwd / "context" / "harness", cwd / "harness"):
+        if cand.is_dir():
+            return cand
+    return None
+
+
+def _read_harness_files(harness_dir: Path) -> dict[str, str]:
+    """Every file in the harness tree, as rel -> text."""
+    out: dict[str, str] = {}
+    for p in sorted(harness_dir.rglob("*")):
+        if not p.is_file() or "__pycache__" in p.parts:
+            continue
+        try:
+            out[p.relative_to(harness_dir).as_posix()] = p.read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            continue
+    return out
+
+
+def _apply_harness_edits(
+    harness_dir: Path, edits: list
+) -> tuple[list[str], list[str]]:
+    """Write the model's edits into the harness tree; return (applied, refused).
+
+    A path that escapes the tree is refused rather than written: the tree is the
+    one place a proposal can touch, and a proposal that reaches outside it has
+    to be told no rather than obeyed.
+    """
+    root = harness_dir.resolve()
+    applied: list[str] = []
+    refused: list[str] = []
+    for edit in edits:
+        if not isinstance(edit, dict):
+            refused.append("(not an object)")
+            continue
+        raw = str(edit.get("path") or "").strip().replace("\\", "/")
+        if not raw:
+            refused.append("(no path)")
+            continue
+        try:
+            rel = normalize_rel(raw)
+        except ValueError:
+            refused.append(f"{raw} (escapes the harness)")
+            continue
+        target = root / rel
+        try:
+            resolved = target.resolve()
+        except OSError:
+            refused.append(f"{rel} (unresolvable path)")
+            continue
+        if resolved != root and root not in resolved.parents:
+            refused.append(f"{rel} (escapes the harness)")
+            continue
+        action = str(edit.get("action") or "write").strip().lower()
+        if action == "delete":
+            if target.is_file():
+                target.unlink()
+                applied.append(rel)
+            else:
+                refused.append(f"{rel} (not present)")
+            continue
+        content = edit.get("content")
+        if not isinstance(content, str):
+            refused.append(f"{rel} (no content)")
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        applied.append(rel)
+    return applied, refused
 
 
 def _opencode_dir() -> Path:

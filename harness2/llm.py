@@ -39,6 +39,19 @@ class LLMError(RuntimeError):
     pass
 
 
+class LLMTruncated(LLMError):
+    """The reply was cut off by the model's output budget.
+
+    Distinct from a generic failure because the fix is different: the caller has to
+    ask for less, not retry the same request. A truncated JSON body fails to parse
+    with a message about a comma, which says nothing about the real cause.
+    """
+
+    def __init__(self, message: str, *, model: str = ""):
+        super().__init__(message)
+        self.model = model
+
+
 @dataclass(frozen=True)
 class Provider:
     name: str
@@ -73,6 +86,7 @@ def chat(
     provider: Optional[Provider] = None,
     retries: int = 3,
     timeout: int = 180,
+    usage: Optional[Dict[str, Any]] = None,
 ) -> str:
     p = provider or resolve_provider()
     if p is None:
@@ -93,7 +107,10 @@ def chat(
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data: Dict[str, Any] = json.loads(resp.read().decode())
-            return data["choices"][0]["message"]["content"] or ""
+            if usage is not None:
+                usage.update(data.get("usage") or {})
+                usage.setdefault("model", p.model)
+            return _content(data, p)
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:500]
             last = LLMError(f"HTTP {e.code} from {p.name}: {body}")
@@ -101,8 +118,33 @@ def chat(
                 break
         except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError) as e:
             last = e
-        time.sleep(2**attempt)
+        # Back off, but never after the final attempt: there is nothing to wait for.
+        if attempt < retries - 1:
+            time.sleep(2**attempt)
     raise LLMError(f"LLM call failed: {last}")
+
+
+def _content(data: Dict[str, Any], p: Provider) -> str:
+    """The assistant text, with the truncation case raised as its own error.
+
+    A reply that hit the output budget arrives as valid text that stops mid-sentence.
+    Returning it makes the caller fail later, in a JSON parser, with a message about a
+    missing comma. Saying so here is the difference between "the model was cut off" and
+    "the model wrote invalid JSON".
+    """
+    choices = data.get("choices") or []
+    if not choices:
+        raise LLMError(f"LLM call to {p.name} returned no choices: {str(data)[:200]}")
+    choice = choices[0] or {}
+    finish = choice.get("finish_reason")
+    if finish == "length":
+        raise LLMTruncated(
+            f"the reply from {p.name}/{p.model} was cut off by the {max_tokens}-token "
+            f"output budget. Ask for less in one call, or raise max_tokens.",
+            model=p.model,
+        )
+    message = choice.get("message") or {}
+    return str(message.get("content") or "")
 
 
 def extract_json(text: str) -> Any:
@@ -117,4 +159,14 @@ def extract_json(text: str) -> Any:
     start, end = t.find("{"), t.rfind("}")
     if start < 0 or end <= start:
         raise LLMError(f"No JSON object in model reply: {text[:300]!r}")
-    return json.loads(t[start : end + 1])
+    body = t[start : end + 1]
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        # The raw decoder message points at a comma, which says nothing about the
+        # real cause: a reply cut off mid-object fails exactly here.
+        raise LLMTruncated(
+            f"the model's reply is not valid JSON ({exc.msg} at line {exc.lineno} "
+            f"column {exc.colno}). It was probably cut off mid-object; ask for less "
+            f"in one call, or check the model's output budget.",
+        ) from exc

@@ -15,6 +15,8 @@ of the deliverable: they are scaffolding, not the agent's work.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -41,6 +43,26 @@ __all__ = ["GeneralTaskAdapter"]
 # disk, and the evidence tree is built once per stage.
 _SOURCE_ROOM_BYTES = 32_000_000
 _SOURCE_ROOM_FILE_BYTES = 500_000
+
+# Where the harness's runnable parts are staged inside a rollout worktree.
+# Never the repository root: the project has its own `scripts/` and
+# `AGENTS.md`, and the harness must not overwrite them.
+_STAGE_DIR = ".harness_staged"
+
+
+def _verdict_from_output(output: str) -> Optional[bool]:
+    """Read the recorded verdict back out of a verification artifact.
+
+    `None` means the artifact holds no verdict -- which is NOT a pass. A
+    candidate whose verification never ran is ungraded, and saying so is the
+    difference between "the command failed" and "nothing was checked".
+    """
+    head = output[:400]
+    if head.startswith("VERIFICATION: PASSED"):
+        return True
+    if head.startswith("VERIFICATION: FAILED"):
+        return False
+    return None
 
 
 def _ensure_excluded(repo: Path, entry: str) -> None:
@@ -300,16 +322,80 @@ class GeneralTaskAdapter:
 
         return launch
 
+    def _render_harness(self, harness_dir: Optional[Path]) -> tuple[str, Dict[str, object]]:
+        """The improver's harness as text, plus a record of what it contained.
+
+        This is the whole point of the loop: a harness that never reaches the
+        solver makes every candidate the same candidate. The text goes into the
+        solver's prompt, where it actually steers the work.
+        """
+        surface = self.substrate.surface()
+        record: Dict[str, object] = {"applied": False}
+        if not harness_dir or not Path(harness_dir).is_dir():
+            record["reason"] = "no harness directory"
+            return "", record
+        t = tree.read_tree(surface, harness_dir)
+        if not t:
+            record["reason"] = "the harness tree was empty"
+            return "", record
+        text = tree.render_harness_text(surface, t)
+        record.update(
+            {
+                "applied": bool(text.strip()),
+                "files": len(t),
+                "chars": len(text),
+                "digest": hashlib.sha1(text.encode("utf-8")).hexdigest()[:12],
+            }
+        )
+        return text, record
+
+    def _stage_harness(self, harness_dir: Optional[Path], wt_path: Path) -> List[str]:
+        """Write the harness's runnable parts into the worktree; return the paths written.
+
+        They go under `.harness_staged/`, never at the repository root: a project
+        already has `scripts/` and `AGENTS.md` of its own, and the harness must
+        not overwrite them. Staged paths are scaffolding, so they are kept out
+        of the deliverable diff.
+        """
+        if not harness_dir or not Path(harness_dir).is_dir():
+            return []
+        surface = self.substrate.surface()
+        t = tree.read_tree(surface, harness_dir)
+        if not t:
+            return []
+        staged_root = wt_path / _STAGE_DIR
+        written: List[str] = []
+        for rel, body in sorted(t.items()):
+            if rel in surface.always_on:
+                continue  # always-on prose rides in the prompt, not on disk
+            target = staged_root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+            written.append(f"{_STAGE_DIR}/{rel}")
+        return written
+
     def _run_verify(self, wt_path: Path, timeout: int) -> tuple:
+        """Run the verification command; return (passed, output, exit status).
+
+        The exit status is the verdict. A timeout is not a failing test: it is
+        the command not finishing, and it is recorded as its own thing so the
+        reader is not told a test failed when nothing ran to completion.
+        """
         if not self.verify_cmd:
-            return None, ""
+            return None, "", None
         try:
             proc = subprocess.run(
                 self.verify_cmd, cwd=wt_path, shell=True, capture_output=True, text=True, timeout=timeout
             )
-            return proc.returncode == 0, (proc.stdout + "\n" + proc.stderr).strip()
-        except Exception as e:  # timeout, missing binary, ...
-            return False, f"Execution error: {e}"
+            return (
+                proc.returncode == 0,
+                (proc.stdout + "\n" + proc.stderr).strip(),
+                proc.returncode,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"Execution error: timed out after {timeout}s", None
+        except Exception as e:  # missing binary, bad shell syntax, ...
+            return False, f"Execution error: {e}", None
 
     def execute(
         self,
@@ -322,18 +408,31 @@ class GeneralTaskAdapter:
         repair_rounds: int = 1,
         extra_files: Optional[List[str]] = None,
     ) -> Path:
-        """One candidate: isolated worktree -> LLM edits -> verify -> repair -> independent critique."""
+        """One candidate: isolated worktree -> LLM edits -> verify -> repair -> independent critique.
+
+        `harness_dir` is the improver's proposal for this candidate. It is not
+        decoration: its text becomes the solver's operating instructions and its
+        runnable parts are staged into the worktree. A candidate whose harness
+        differs from another's therefore behaves differently, which is the only
+        reason to run both.
+        """
         label = run_id.replace("/", "__")
         wt_path = self.wt_mgr.create(self.session_id, label)
         timeout = timeout or 600
         strength = agent.verification_strength(self.verify_cmd)
         log: Dict[str, object] = {"strategy": strategy, "verification_strength": strength}
 
+        harness_text, harness_log = self._render_harness(harness_dir)
+        staged = self._stage_harness(harness_dir, wt_path)
+        harness_log["staged_paths"] = staged
+        log["harness"] = harness_log
+
         provider = llm.resolve_provider()
         claims: List[str] = []
+        verify_status: Optional[int] = None
         if provider is None:
             log["llm"] = "not configured: verify-only run (no code was generated)"
-            test_passed, test_output = self._run_verify(wt_path, timeout)
+            test_passed, test_output, verify_status = self._run_verify(wt_path, timeout)
         else:
             log["llm"] = provider.public()
             memory_md = self.db.render_longterm_memory_markdown()
@@ -341,18 +440,40 @@ class GeneralTaskAdapter:
             test_passed, test_output = None, ""
             for attempt in range(1 + max(0, repair_rounds)):
                 try:
-                    res = agent.solve(wt_path, self.goal, strategy, memory_md, feedback, extra_files)
+                    res = agent.solve(
+                        wt_path,
+                        self.goal,
+                        strategy,
+                        memory_md,
+                        feedback,
+                        extra_files,
+                        harness=harness_text,
+                    )
                 except (llm.LLMError, ValueError) as e:
                     log.setdefault("errors", []).append(f"attempt {attempt}: {e}")
                     break
                 claims = res["claims"] or claims
                 log.setdefault("attempts", []).append({"plan": res["plan"], "touched": res["touched"]})
-                test_passed, test_output = self._run_verify(wt_path, timeout)
+                test_passed, test_output, verify_status = self._run_verify(wt_path, timeout)
                 if test_passed is not False:
                     break
                 feedback = f"Verification command `{self.verify_cmd}` failed:\n{test_output[-4000:]}"
 
-        git_diff = self.wt_mgr.get_diff(self.session_id, label)
+        # The verdict is the exit status of the verification command, recorded as
+        # it ran. A judge that reads it later must see the same thing the rollout
+        # saw, so it is written into the artifact and kept in memory.
+        self._verdicts[label] = bool(test_passed)
+        if self.verify_cmd is None:
+            verdict_line = "VERIFICATION: no verification command was given"
+        elif test_passed:
+            verdict_line = "VERIFICATION: PASSED (exit status 0)"
+        elif verify_status is None:
+            verdict_line = "VERIFICATION: FAILED (the command did not complete)"
+        else:
+            verdict_line = f"VERIFICATION: FAILED (exit status {verify_status})"
+        test_output = f"{verdict_line}\n\n{test_output}".strip() + "\n"
+
+        git_diff = self.wt_mgr.get_diff(self.session_id, label, exclude=staged)
         review = (
             agent.critique(self.goal, git_diff, test_output, claims, strength)
             if provider is not None and git_diff.strip()
@@ -375,7 +496,7 @@ class GeneralTaskAdapter:
         (run_dir / "test_output.txt").write_text(test_output, encoding="utf-8")
         (run_dir / "worktree_path.txt").write_text(str(wt_path), encoding="utf-8")
         (run_dir / "candidate.json").write_text(
-            __import__("json").dumps({**log, "claims": claims, "test_passed": test_passed}, indent=2),
+            json.dumps({**log, "claims": claims, "test_passed": test_passed}, indent=2),
             encoding="utf-8",
         )
         return run_dir
@@ -443,14 +564,17 @@ class GeneralTaskAdapter:
         The verdict is the verification command's **exit status**, recorded
         when the rollout ran -- not a guess made from its output. A test
         runner's output format is its own business; its exit status is not.
+        The recorded status is read from the artifact, so a judge in another
+        process sees the same verdict the rollout saw.
         """
         if not self.verify_cmd:
             return None
-        passed = (run_dir / "test_output.txt").read_text(
-            encoding="utf-8", errors="replace"
-        )
+        output = (run_dir / "test_output.txt").read_text(encoding="utf-8", errors="replace")
         ok = self._verdicts.get(Path(run_dir).name)
         if ok is None:
-            # No recorded status: the command never ran. That is not a pass.
-            ok = False
-        return {"n_passed": 1 if ok else 0, "n_criteria": 1, "detail": passed[:2000]}
+            ok = _verdict_from_output(output)
+        if ok is None:
+            # The command never ran, or its verdict was not recorded. That is
+            # neither a pass nor a failure: it is ungraded.
+            return None
+        return {"n_passed": 1 if ok else 0, "n_criteria": 1, "detail": output[:2000]}

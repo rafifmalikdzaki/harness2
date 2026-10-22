@@ -32,6 +32,12 @@ from .. import llm
 MAX_CONTEXT_CHARS = 60_000
 MAX_FILE_CHARS = 12_000
 
+# The harness travels in the prompt, so it needs a budget of its own: the
+# always-on prose competes with the goal, and a harness nobody can read is
+# not a harness.
+MAX_HARNESS_CHARS = 24_000
+MAX_HARNESS_DOC_CHARS = 4_000
+
 STRATEGIES = {
     "minimal": "Make the smallest correct change that fully achieves the goal.",
     "thorough": "Achieve the goal robustly: handle edge cases and add/adjust tests where sensible.",
@@ -42,6 +48,8 @@ STRATEGIES = {
 }
 
 SOLVER_SYSTEM = """You are a careful software/research engineer working in a git worktree.
+The HARNESS section, when it is present, is the operating instructions for this run:
+follow its rules and its procedures unless the Goal contradicts them.
 Return ONLY a JSON object:
 {"plan": "<short plan>",
  "edits": [{"path": "<repo-relative path>", "action": "write"|"delete", "content": "<full new file content>"}],
@@ -139,14 +147,28 @@ def solve(
     memory_md: str = "",
     feedback: str = "",
     extra_files: Optional[List[str]] = None,
+    harness: str = "",
 ) -> Dict[str, Any]:
+    """Solve the goal in `root` and return the plan, the claims and the files touched.
+
+    `harness` is the improver's proposal, rendered as text. It is placed BEFORE the
+    goal so it reads as the operating instructions for this run -- this is the only
+    channel by which a proposed harness reaches the solver, and without it every
+    candidate runs the same instructions and the candidates differ in nothing but
+    luck.
+    """
     ctx = gather_context(root, goal, extra_files)
-    user = (
-        f"# Goal\n{goal}\n\n# Strategy\n{STRATEGIES.get(strategy, STRATEGIES['minimal'])}\n\n"
-        + (f"# Project memory\n{memory_md}\n\n" if memory_md.strip() else "")
-        + (f"# Feedback from previous attempt\n{feedback}\n\n" if feedback else "")
-        + ctx
-    )
+    parts: List[str] = []
+    if harness.strip():
+        parts.append(harness.strip())
+    parts.append(f"# Goal\n{goal}")
+    parts.append(f"# Strategy\n{STRATEGIES.get(strategy, STRATEGIES['minimal'])}")
+    if memory_md.strip():
+        parts.append(f"# Project memory\n{memory_md}")
+    if feedback:
+        parts.append(f"# Feedback from previous attempt\n{feedback}")
+    parts.append(ctx)
+    user = "\n\n".join(parts)
     reply = llm.chat(
         [{"role": "system", "content": SOLVER_SYSTEM}, {"role": "user", "content": user}],
         temperature={"minimal": 0.1, "thorough": 0.4, "skeptical": 0.2}.get(strategy, 0.2),

@@ -189,6 +189,74 @@ def always_on_text(surface: SurfaceSpec, tree: Tree) -> str:
     return "\n\n".join(tree.get(a, "") for a in surface.always_on)
 
 
+def _frontmatter(text: str, key: str) -> str:
+    """A `key: value` from a file's YAML frontmatter, or ""."""
+    m = re.search(rf"^{key}:\s*(.+)$", text[:800], re.M)
+    return m.group(1).strip().strip("\"'") if m else ""
+
+
+def render_harness_text(
+    surface: SurfaceSpec,
+    tree: Tree,
+    *,
+    max_chars: int = 24_000,
+    max_doc_chars: int = 4_000,
+) -> str:
+    """The harness as text a model can be given.
+
+    A model that cannot open a file needs the body in the prompt, so the
+    always-on prose travels whole and each on-demand component travels with its
+    description. The whole thing is bounded: a harness nobody can read is not a
+    harness, and every token of it competes with the agent's own output budget.
+    """
+    parts: list[str] = [
+        "# HARNESS -- operating instructions for this run\n",
+        "These instructions were written for this specific task by an improver that "
+        "read the previous attempts. Follow them unless the Goal contradicts them.",
+    ]
+
+    for rel in surface.always_on:
+        body = tree.get(rel, "").strip()
+        if not body:
+            continue
+        parts.append(f"## {rel}\n\n{body[:max_chars]}")
+
+    r = _rx(surface)
+    skills = skill_names(surface, tree)
+    if skills:
+        block = ["## Skills you can invoke\n"]
+        for name in skills:
+            rel = f"{surface.skill_dir}/{name}/SKILL.md"
+            body = tree.get(rel, "")
+            desc = _frontmatter(body, "description") or "(no description)"
+            block.append(f"### {name} -- {desc}\n\n{body.strip()[:max_doc_chars]}")
+        parts.append("\n\n".join(block))
+
+    subs = subagent_names(surface, tree)
+    if subs:
+        block = ["## Delegated subagents\n"]
+        for name in subs:
+            rel = f"sub_agents/{name}/AGENT.md"
+            body = tree.get(rel, "")
+            desc = _frontmatter(body, "description") or "(no description)"
+            block.append(f"### {name} -- {desc}\n\n{body.strip()[:max_doc_chars]}")
+        parts.append("\n\n".join(block))
+
+    scripts = sorted(rel for rel in tree if r["script"].fullmatch(rel))
+    if scripts:
+        block = ["## Deterministic scripts\n"]
+        for rel in scripts:
+            first = tree.get(rel, "").strip().splitlines()
+            purpose = next((ln for ln in first if ln.strip()), "")
+            block.append(f"- `{rel}` -- {purpose}")
+        parts.append("\n\n".join(block))
+
+    text = "\n\n".join(parts)
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "\n\n(harness truncated at its budget)"
+    return text
+
+
 def autotrigger(surface: SurfaceSpec, tree: Tree, *, always_on_max: int | None = None) -> list[str]:
     """Give every skill a trigger line in always-on text; return the names repaired.
 

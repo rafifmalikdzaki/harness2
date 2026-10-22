@@ -30,7 +30,7 @@ from .tree import SurfaceSpec
 
 ModelId = str
 
-CHANNELS = ("claude_cli", "opencode")
+CHANNELS = ("claude_cli", "opencode", "http")
 
 
 @dataclass(frozen=True)
@@ -58,7 +58,9 @@ def resolve_channel_model(
 ) -> ChannelSpec:
     """The one channel->model mapping; a lone override of either raises."""
     use_default = kind is None and model is None
-    if (kind is None) != (model is None):
+    # The `http` channel may be named without a model: it falls back to the
+    # configured provider's own model, so there is nothing to mismatch.
+    if (kind is None) != (model is None) and not (kind == "http" and model is None):
         raise ValueError(
             "channel and model must be overridden TOGETHER (a bare-id/provider-prefixed "
             f"mismatch fails silently downstream); got kind={kind!r}, model={model!r}"
@@ -70,7 +72,10 @@ def resolve_channel_model(
     if model is None:
         model = config.PROPOSER_MODEL_BY_CHANNEL[kind]
     if not model.strip():
-        if use_default:
+        # An empty model is only survivable on the `http` channel, which falls
+        # back to the configured provider's own model. The CLI channels name a
+        # binary and must be told which model to run.
+        if use_default or kind == "http":
             return ChannelSpec(kind, "", effort=effort, steps=steps, timeout=timeout)
         raise ValueError("model override must not be empty")
     if kind == "opencode" and "/" not in model:
