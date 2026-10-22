@@ -149,7 +149,7 @@ def judge_bases(adapter, ns_dir: Path) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        prog="harness2.cli.judge", description=__doc__, formatter_class=C.HelpFormatter
+        prog="harness2-judge", description=__doc__, formatter_class=C.HelpFormatter
     )
     C.add_cell_args(p.add_argument_group("cell"))
     C.add_run_identity_args(p.add_argument_group("run identity (names the sweep)"))
@@ -162,7 +162,13 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     modes = C.parse_modes(args.modes)
 
-    config.validate_models(judge=True)
+    try:
+        config.validate_models(judge=True)
+    except config.ConfigError as exc:
+        # A missing model is a configuration problem, not a crash: say what is
+        # missing and exit with the usual status.
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     adapter = C.make_adapter(args.bench, args.subset, args.substrate)
     ns = C.summary_namespace(adapter, args.k, seed=args.seed)
     ns_dir = C.runs_root_for(adapter) / ns

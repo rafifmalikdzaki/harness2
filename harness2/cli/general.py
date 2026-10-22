@@ -41,11 +41,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 
 from .. import config, llm
-from ..adapters.general import GeneralTaskAdapter, candidate_rows, render_candidate_table
+from ..adapters.general import (
+    GeneralTaskAdapter,
+    candidate_rows,
+    dirty_tree_warning,
+    render_candidate_table,
+)
 from ..core import progress
 from ..core.proposer import Proposer
 from ..core.retention import prune_runs
@@ -150,6 +156,16 @@ def main(argv=None) -> int:
             "'opencode' uses the OpenCode CLI and needs a provider-prefixed id."
         ),
     )
+    parser.add_argument(
+        "--runtime",
+        choices=("http", "opencode"),
+        default="http",
+        help=(
+            "How the ROLLOUT's solver runs. 'http' (default) is a model call that "
+            "writes files; 'opencode' is a real agent session under the OpenCode CLI, "
+            "which needs the opencode binary and a provider-prefixed model id."
+        ),
+    )
     parser.add_argument("--timeout", type=int, default=1800, help="Per-rollout timeout in seconds")
     parser.add_argument("--runs-root", type=Path, default=None, help="Where run artifacts go (default: <workspace>/.harness2/runs)")
     parser.add_argument(
@@ -217,8 +233,25 @@ def main(argv=None) -> int:
         except ValueError as exc:
             parser.error(str(exc))
 
+    if args.runtime == "opencode":
+        runtime_model = (args.model or config.SOLVER_MODEL_OC).strip()
+        if not runtime_model:
+            parser.error(
+                "no solver model: the opencode runtime needs a provider-prefixed id. "
+                "Set HARNESS2_SOLVER_MODEL or pass --model."
+            )
+        if not shutil.which("opencode"):
+            parser.error(
+                "the opencode runtime needs the `opencode` binary on PATH. "
+                "Use --runtime http for the plain model service."
+            )
+
     if args.dry_run:
         return _dry_run(workspace, args.goal, args.k, modes, args.channel, args.verify)
+
+    dirty = dirty_tree_warning(workspace)
+    if dirty:
+        print(f"[!] {dirty}", file=sys.stderr)
 
     solver_model = (args.model or config.SOLVER_MODEL_OC).strip()
     if not solver_model:
@@ -234,6 +267,7 @@ def main(argv=None) -> int:
             model=solver_model,
             selector_model=channel_spec.model,
             channel=args.channel,
+            runtime=args.runtime,
             timeout=args.timeout,
             allow_mcp=args.allow_mcp,
             sandbox=not args.no_sandbox,

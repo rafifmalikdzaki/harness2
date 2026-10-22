@@ -17,13 +17,14 @@
 from __future__ import annotations
 
 import argparse
+import sys
 
 from harness2.cli._common import make_adapter
 from harness2.preflight import check
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(prog="harness2-check", description=__doc__)
     p.add_argument("--bench", choices=("jb", "lab", "wb"), required=True)
     p.add_argument("--subset", choices=("office", "web", "code"))
     p.add_argument("--substrate", choices=("oc", "cx"), default="oc")
@@ -33,10 +34,15 @@ def main(argv=None):
         errors = check(adapter, judge=True)
     except (OSError, RuntimeError, ValueError) as exc:
         errors = [str(exc)]
+    # Failures go to stderr: in a pipeline they must not be mistaken for the
+    # command's normal output.
     for error in errors:
-        print(f"FAIL: {error}")
+        print(f"FAIL: {error}", file=sys.stderr)
     if errors:
-        print(f"Setup incomplete: {len(errors)} issue(s). See docs/BENCHMARKS.md.")
+        print(
+            f"Setup incomplete: {len(errors)} issue(s). See docs/BENCHMARKS.md.",
+            file=sys.stderr,
+        )
         return 1
     print(
         f"Ready: {adapter.spec.name}/{args.substrate}; {len(adapter.tasks())} tasks. "

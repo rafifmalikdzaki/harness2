@@ -58,6 +58,26 @@ class RetentionPolicy:
         )
 
 
+def _is_candidate_dir(p: Path) -> bool:
+    """A directory holding one candidate's artifacts."""
+    return (p / "candidate.json").is_file() or (p / "diff.patch").is_file()
+
+
+def _is_session_dir(p: Path) -> bool:
+    """A directory holding one session's candidate artifacts.
+
+    The general path keeps a session's candidates in a sibling subtree of the
+    namespace directory that holds the session's summary. Without recognising
+    it, the candidates are never pruned: the policy reports that it ran and
+    leaves the bulk of the disk behind.
+    """
+    try:
+        children = list(p.iterdir())
+    except OSError:
+        return False
+    return any(c.is_dir() and _is_candidate_dir(c) for c in children)
+
+
 def _run_dirs(runs_root: Path) -> list[Path]:
     """The session directories under a runs root, oldest first."""
     if not runs_root.is_dir():
@@ -72,6 +92,8 @@ def _run_dirs(runs_root: Path) -> list[Path]:
                 if c.is_dir() and (c / "summary.json").is_file():
                     found.append((c.stat().st_mtime, c))
         elif (p / "summary.json").is_file():
+            found.append((p.stat().st_mtime, p))
+        elif _is_session_dir(p):
             found.append((p.stat().st_mtime, p))
     return [p for _, p in sorted(found)]
 

@@ -22,6 +22,7 @@ dependencies = []
 [project.optional-dependencies]
 render = ["openpyxl>=3.1,<4", "python-pptx>=1,<2"]
 bridge = ["litellm[proxy]==1.95.0", "fastapi==0.139.2", "google-auth==2.56.3"]
+mcp = ["mcp>=1.0.0"]
 
 [project.scripts]
 harness2 = "harness2.cli.run_sweep:main"
@@ -35,6 +36,7 @@ harness2-mcp = "harness2.mcp_server:main"
 harness2-solve = "harness2.cli.solve:main"
 harness2-finish = "harness2.cli.finish:main"
 harness2-general = "harness2.cli.general:main"
+harness2-doctor = "harness2.cli.doctor:main"
 
 [tool.setuptools.packages.find]
 include = ["harness2*"]

@@ -65,7 +65,6 @@ class WorktreeManager:
 
     def create(self, session_id: str, label: str) -> Path:
         """Create a new worktree branched from current HEAD."""
-        branch = self.branch_name(session_id, label)
         dest = self.worktree_dir(session_id, label)
 
         # Clean existing directory if stale
@@ -134,9 +133,13 @@ class WorktreeManager:
         return diff_text
 
     def remove(self, session_id: str, label: str, force: bool = True) -> None:
-        """Remove one worktree and its branch."""
+        """Remove one worktree.
+
+        The worktree is detached, so there is no branch to delete: creating
+        one per candidate is what left the repository's branch list littered
+        with `harness2/<session>/<label>` entries.
+        """
         dest = self.worktree_dir(session_id, label)
-        branch = self.branch_name(session_id, label)
 
         if dest.exists():
             args = ["worktree", "remove"]
@@ -150,9 +153,6 @@ class WorktreeManager:
                     shutil.rmtree(dest, ignore_errors=True)
 
         subprocess.run(["git", "worktree", "prune"], cwd=self.repo_root, capture_output=True)
-        subprocess.run(
-            ["git", "branch", "-D", branch], cwd=self.repo_root, capture_output=True
-        )
 
     def cleanup_session(self, session_id: str) -> List[str]:
         """Delete all active worktrees associated with a session."""

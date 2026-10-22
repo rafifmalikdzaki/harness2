@@ -110,7 +110,7 @@ def chat(
             if usage is not None:
                 usage.update(data.get("usage") or {})
                 usage.setdefault("model", p.model)
-            return _content(data, p)
+            return _content(data, p, max_tokens)
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:500]
             last = LLMError(f"HTTP {e.code} from {p.name}: {body}")
@@ -124,7 +124,7 @@ def chat(
     raise LLMError(f"LLM call failed: {last}")
 
 
-def _content(data: Dict[str, Any], p: Provider) -> str:
+def _content(data: Dict[str, Any], p: Provider, max_tokens: int) -> str:
     """The assistant text, with the truncation case raised as its own error.
 
     A reply that hit the output budget arrives as valid text that stops mid-sentence.
@@ -157,8 +157,15 @@ def extract_json(text: str) -> Any:
                 t = c
                 break
     start, end = t.find("{"), t.rfind("}")
-    if start < 0 or end <= start:
+    if start < 0:
         raise LLMError(f"No JSON object in model reply: {text[:300]!r}")
+    if end <= start:
+        # An opening brace with no closing one: the reply stopped mid-object.
+        raise LLMTruncated(
+            "the model's reply starts a JSON object but never closes it. It was "
+            "probably cut off mid-object; ask for less in one call, or check the "
+            "model's output budget."
+        )
     body = t[start : end + 1]
     try:
         return json.loads(body)

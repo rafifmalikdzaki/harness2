@@ -29,9 +29,19 @@ _AGENT_BINARIES = {
 }
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "allow_model_calls: this test exercises the model client itself, so the "
+        "autouse block is lifted; the HTTP layer must be stubbed inside the test",
+    )
+
+
 @pytest.fixture(autouse=True)
-def _no_paid_model_calls(monkeypatch):
+def _no_paid_model_calls(request, monkeypatch):
     """Make every model call in a test fail loudly instead of leaving the machine."""
+    if request.node.get_closest_marker("allow_model_calls"):
+        return
 
     def refuse(*_a, **_kw):
         raise AssertionError(

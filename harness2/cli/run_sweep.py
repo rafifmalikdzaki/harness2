@@ -46,7 +46,7 @@ from . import _common as C
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="harness2.cli.run_sweep", description=__doc__, formatter_class=C.HelpFormatter
+        prog="harness2", description=__doc__, formatter_class=C.HelpFormatter
     )
     C.add_cell_args(p.add_argument_group("cell"))
     C.add_run_identity_args(p.add_argument_group("run identity (enters the namespace)"))

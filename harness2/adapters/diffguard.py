@@ -27,8 +27,7 @@ operator says otherwise.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import Iterable
+from dataclasses import dataclass
 
 __all__ = ["PatchStats", "analyze_patch", "describe_destructive"]
 

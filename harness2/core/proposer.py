@@ -33,8 +33,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .. import config
-from .. import llm
+from .. import config, llm
 from ..adapters.sandbox import sandbox_available
 from ..substrate.opencode import opencode_command
 from .spec import ChannelSpec
@@ -150,6 +149,14 @@ class ProposerError(RuntimeError):
         super().__init__(message)
         self.attempts = attempts
         self.cost_usd = cost_usd
+
+
+class NonRetryableError(RuntimeError):
+    """A failure a retry cannot fix: a missing key, a missing binary.
+
+    Retrying it costs the caller the backoff and changes nothing, so the
+    session gives up at once and says what is missing.
+    """
 
 
 @dataclass
@@ -269,6 +276,9 @@ class Proposer:
                 return r
             except subprocess.TimeoutExpired:
                 last = f"timeout after {wall}s"
+            except NonRetryableError as exc:
+                last = str(exc)
+                break
             except Exception as exc:
                 last = f"{type(exc).__name__}: {exc}"
             finally:
@@ -321,7 +331,7 @@ class Proposer:
         kind = _session_kind(label)
         provider = llm.resolve_provider()
         if provider is None:
-            return "", 0.0, (
+            raise NonRetryableError(
                 "no LLM configured: set INCEPTION_API_KEY (or HARNESS2_LLM_BASE_URL, "
                 "HARNESS2_LLM_API_KEY and HARNESS2_LLM_MODEL) to use the http channel"
             )

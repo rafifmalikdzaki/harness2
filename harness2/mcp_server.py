@@ -681,7 +681,7 @@ def harness2_recursion(
         return {"status": "error", "message": "channel must be 'http' or 'opencode'."}
 
     from harness2 import config, llm
-    from harness2.adapters.general import GeneralTaskAdapter
+    from harness2.adapters.general import GeneralTaskAdapter, dirty_tree_warning
     from harness2.core.proposer import Proposer
     from harness2.core.schedule import mode_token, run_domain
     from harness2.core.spec import resolve_channel_model
@@ -764,6 +764,7 @@ def harness2_recursion(
         "runs_root": str(adapter.spec.runs_root),
         "library_root": str(library_root),
         "report": str(report),
+        "warnings": [w for w in [dirty_tree_warning(ws)] if w],
     }
 
 
@@ -775,6 +776,7 @@ def harness2_memory_status(
     keep_evidence_runs: int = 3,
     keep_transcript_runs: int = 10,
     keep_runs: int = 50,
+    max_age_days: int = 90,
 ) -> Dict[str, Any]:
     """Report, and optionally prune, the harness's memory for a workspace.
 
@@ -796,6 +798,7 @@ def harness2_memory_status(
         keep_evidence_runs: How many recent runs keep their evidence trees.
         keep_transcript_runs: How many recent runs keep their transcripts.
         keep_runs: How many runs are kept at all.
+        max_age_days: Runs older than this are dropped regardless of count.
     """
     ws = Path(workspace).expanduser().resolve()
     harness_dir = ws / ".harness2"
@@ -809,6 +812,7 @@ def harness2_memory_status(
         keep_evidence_runs=keep_evidence_runs,
         keep_transcript_runs=keep_transcript_runs,
         keep_runs=keep_runs,
+        max_age_days=max_age_days,
     )
 
     def size_of(path: Path) -> int:

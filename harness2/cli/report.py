@@ -57,7 +57,7 @@ def _spend_and_fallbacks(ns_dir: Path, modes: tuple[str, ...], k: int) -> tuple[
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        prog="harness2.cli.report", description=__doc__, formatter_class=C.HelpFormatter
+        prog="harness2-report", description=__doc__, formatter_class=C.HelpFormatter
     )
     C.add_cell_args(p.add_argument_group("cell"))
     g = p.add_argument_group("run identity (names the sweeps)")

@@ -23,17 +23,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+from .. import llm
 from ..core import tree
 from ..core.compress import read_text
 from ..core.memory_db import MemoryDB
 from ..core.spec import BenchPrompts, BenchSpec, ChannelSpec
 from ..substrate.base import Install, RunRequest
 from ..substrate.opencode import OpencodeSubstrate
+from . import agent
 from .diffguard import analyze_patch
 from .general_runner import run_opencode_in_workspace, stage_harness
-from .sandbox import sandbox_argv, sandbox_available, sandbox_env
-from . import agent
-from .. import llm
+from .sandbox import sandbox_available
 from .worktree import WorktreeManager
 
 __all__ = ["GeneralTaskAdapter", "candidate_rows", "render_candidate_table"]
@@ -49,6 +49,35 @@ _SOURCE_ROOM_FILE_BYTES = 500_000
 # Never the repository root: the project has its own `scripts/` and
 # `AGENTS.md`, and the harness must not overwrite them.
 _STAGE_DIR = ".harness_staged"
+
+
+def dirty_tree_warning(repo_root: Path) -> str:
+    """A warning when the working tree has uncommitted changes.
+
+    A rollout works from HEAD, so uncommitted work is invisible to it: the
+    candidate never sees the change, and the candidate's diff is applied onto
+    a tree that has it. The second one can conflict; the first one is a
+    silent difference between what the operator thinks the base is and what
+    the candidate was actually given.
+    """
+    try:
+        res = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except Exception:
+        return ""
+    lines = [ln for ln in res.stdout.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    return (
+        f"the working tree has {len(lines)} uncommitted change(s). A rollout works "
+        f"from HEAD and will not see them, and the candidate's diff will be applied "
+        f"on top of them. Commit or stash first."
+    )
 
 
 def _verdict_from_output(output: str) -> Optional[bool]:
@@ -174,6 +203,7 @@ class GeneralTaskAdapter:
         allow_mcp: bool = False,
         sandbox: bool = True,
         channel: str = "http",
+        runtime: str = "http",
     ):
         self.repo_root = Path(repo_root).expanduser().resolve()
         self.goal = goal.strip()
@@ -190,6 +220,11 @@ class GeneralTaskAdapter:
         # `opencode` goes through the OpenCode CLI and needs a provider-prefixed
         # model id.
         self.channel = channel if channel in ("http", "opencode") else "opencode"
+        # How the ROLLOUT's solver runs: the plain model service (`http`), or
+        # a real agent session under the OpenCode CLI (`opencode`). The
+        # OpenCode runtime needs a provider-prefixed model id and the opencode
+        # binary; the http runtime needs an API key and nothing else.
+        self.runtime = runtime if runtime in ("http", "opencode") else "http"
         # The verification verdict per rollout label, recorded as it ran.
         self._verdicts: dict[str, bool] = {}
         self.timeout = int(timeout)
@@ -374,6 +409,20 @@ class GeneralTaskAdapter:
             "must not be called on the shared instance"
         )
 
+    def _sandbox_readonly(self, worktree: Path) -> List[tuple[Path, Path]]:
+        """The read-only mounts a rollout needs beyond its worktree.
+
+        A project's virtualenv lives in the main checkout, not in the
+        worktree: the worktree has the tracked files and nothing else. The
+        rollout needs the virtualenv to run the project's tests, and must not
+        be able to write to it.
+        """
+        pairs: List[tuple[Path, Path]] = []
+        venv = self.repo_root / ".venv"
+        if venv.is_dir():
+            pairs.append((venv, worktree / ".venv"))
+        return pairs
+
     def _launcher(self, worktree: Path, timeout: int):
         """A launcher bound to one worktree, so concurrent rollouts stay isolated."""
 
@@ -436,12 +485,16 @@ class GeneralTaskAdapter:
         return text, record
 
     def _stage_harness(self, harness_dir: Optional[Path], wt_path: Path) -> List[str]:
-        """Write the harness's runnable parts into the worktree; return the paths written.
+        """Write the harness's parts into the worktree; return the paths written.
 
         They go under `.harness_staged/`, never at the repository root: a project
         already has `scripts/` and `AGENTS.md` of its own, and the harness must
         not overwrite them. Staged paths are scaffolding, so they are kept out
         of the deliverable diff.
+
+        The one exception is `AGENTS.md`, which the OpenCode runtime loads from
+        the workspace root -- so it is written there only when the project does
+        not have one of its own.
         """
         if not harness_dir or not Path(harness_dir).is_dir():
             return []
@@ -452,13 +505,52 @@ class GeneralTaskAdapter:
         staged_root = wt_path / _STAGE_DIR
         written: List[str] = []
         for rel, body in sorted(t.items()):
-            if rel in surface.always_on:
-                continue  # always-on prose rides in the prompt, not on disk
             target = staged_root / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(body, encoding="utf-8")
             written.append(f"{_STAGE_DIR}/{rel}")
+        # The always-on prose, as the agent framework would load it.
+        agents = wt_path / "AGENTS.md"
+        if not agents.exists():
+            agents.write_text(
+                tree.always_on_text(surface, t)
+                + f"\n\n<!-- staged by Harness² from {_STAGE_DIR} -->\n",
+                encoding="utf-8",
+            )
+            written.append("AGENTS.md")
         return written
+
+    def _run_opencode_solver(
+        self, wt_path: Path, task_id: str, timeout: int, harness_text: str
+    ) -> tuple[bool, str, str]:
+        """Run the OpenCode runtime in the worktree; return (ok, trajectory, error).
+
+        The harness reaches this runtime twice: as the always-on prose staged
+        into the workspace, and as the text of the prompt, which is what the
+        model actually reads first.
+        """
+        prompt = self.task_prompt(task_id)
+        if harness_text.strip():
+            prompt = f"{harness_text}\n\n{prompt}"
+        try:
+            rollout = run_opencode_in_workspace(
+                workspace=wt_path,
+                prompt=prompt,
+                model=self.model,
+                title=f"general | {task_id}",
+                timeout=timeout,
+                allow_mcp=self.allow_mcp,
+                sandbox=self.sandbox,
+                sandbox_readonly=self._sandbox_readonly(wt_path),
+            )
+        except Exception as exc:
+            return False, "", f"{type(exc).__name__}: {exc}"
+        trajectory = ""
+        if rollout.trajectory.is_file():
+            trajectory = read_text(rollout.trajectory)
+        if not rollout.ok:
+            return False, trajectory, f"the solver exited with status {rollout.exit_code}"
+        return True, trajectory, ""
 
     def _run_verify(self, wt_path: Path, timeout: int) -> tuple:
         """Run the verification command; return (passed, output, exit status).
@@ -516,7 +608,18 @@ class GeneralTaskAdapter:
         provider = llm.resolve_provider()
         claims: List[str] = []
         verify_status: Optional[int] = None
-        if provider is None:
+        trajectory = ""
+        if self.runtime == "opencode":
+            # The OpenCode runtime: a real agent session in the worktree, with
+            # the harness staged into it and carried in the prompt.
+            ok, trajectory, err = self._run_opencode_solver(
+                wt_path, task_id, timeout, harness_text
+            )
+            if not ok and err:
+                log.setdefault("errors", []).append(err)
+            test_passed, test_output, verify_status = self._run_verify(wt_path, timeout)
+            log["llm"] = {"provider": "opencode", "model": self.model}
+        elif provider is None:
             log["llm"] = "not configured: verify-only run (no code was generated)"
             test_passed, test_output, verify_status = self._run_verify(wt_path, timeout)
         else:
@@ -540,6 +643,15 @@ class GeneralTaskAdapter:
                     break
                 claims = res["claims"] or claims
                 log.setdefault("attempts", []).append({"plan": res["plan"], "touched": res["touched"]})
+                # The solver's reasoning, in the shared grammar. It is the only
+                # record of WHY the solver did what it did, and the improver
+                # reads it to decide what to change next.
+                trajectory += (
+                    f"[ACTION] attempt {attempt}: {strategy}\n"
+                    f"[THINKING]\n{res['plan']}\n"
+                    f"[OBSERVATION] wrote {len(res['touched'])} file(s): "
+                    f"{', '.join(res['touched'][:12])}\n\n"
+                )
                 test_passed, test_output, verify_status = self._run_verify(wt_path, timeout)
                 if test_passed is not False:
                     break
@@ -566,7 +678,6 @@ class GeneralTaskAdapter:
             else {"score": None, "issues": [], "unverified_claims": []}
         )
         log["review"] = review
-
         self.db.record_rollout(
             session_id=self.session_id,
             label=label,
@@ -581,6 +692,10 @@ class GeneralTaskAdapter:
         (run_dir / "diff.patch").write_text(git_diff, encoding="utf-8")
         (run_dir / "test_output.txt").write_text(test_output, encoding="utf-8")
         (run_dir / "worktree_path.txt").write_text(str(wt_path), encoding="utf-8")
+        if trajectory:
+            # The solver's own reasoning. Without it the improver and the
+            # selector see a diff and a verdict, and nothing else.
+            (run_dir / "trajectory.jsonl").write_text(trajectory, encoding="utf-8")
         (run_dir / "candidate.json").write_text(
             json.dumps({**log, "claims": claims, "test_passed": test_passed}, indent=2),
             encoding="utf-8",
